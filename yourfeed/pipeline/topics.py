@@ -1,17 +1,18 @@
-"""Search topics for genres of any age: the model lists subtopics and each update searches a few."""
+"""Search topics for genres of any age: the model lists subtopics and each update searches some of them."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from yourfeed.llm import LLMClient, LLMResult
-from yourfeed.search.language import NAMES, languages_of
+from yourfeed.search.language import NAMES, in_language, languages_of
+from yourfeed.search.plan import TAKE
 
 from .select import matches
 from .validate import parse_json
 
 COUNT = 30
-PER_UPDATE = 2
+MIN_PER_UPDATE = 2
 TOPIC_MAX = 40
 
 SCHEMA = {
@@ -52,6 +53,22 @@ def prompts(genre: dict[str, Any], used: list[str]) -> tuple[str, str]:
     return "\n".join(lines), user
 
 
+def per_update(candidates: int) -> int:
+    """Topics to search in one update: one for each TAKE candidates, so no topic fills the genre."""
+    return max(MIN_PER_UPDATE, min(COUNT, -(-candidates // TAKE)))
+
+
+def mixed(topics: list[str], languages: list[str] | None) -> list[str]:
+    """Topics in turn by language, so each update gets some in every language."""
+    groups: dict[str | None, list[str]] = {}
+    for topic in topics:
+        language = next((language for language in languages or [] if in_language(language, topic)), None)
+        groups.setdefault(language, []).append(topic)
+    queues = list(groups.values())
+    return [queue[index] for index in range(max(map(len, queues), default=0)) for queue in queues
+            if index < len(queue)]
+
+
 def parse(text: str, exclude: list[str]) -> list[str]:
     data = parse_json(text)
     values = data.get("topics") if isinstance(data, dict) else None
@@ -67,4 +84,4 @@ def make_topics(llm: LLMClient, genre: dict[str, Any], used: list[str]) -> tuple
     system, user = prompts(genre, used)
     result = llm.complete(system, [{"role": "user", "content": user}], SCHEMA)
     topics = [] if result.refused else parse(result.text, list(genre.get("exclude_terms") or []))
-    return topics, result
+    return mixed(topics, languages_of(list(genre.get("locales") or ["all"]))), result

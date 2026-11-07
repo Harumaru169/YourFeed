@@ -1,7 +1,7 @@
 import json
 
 from yourfeed.llm import LLMResult
-from yourfeed.pipeline.topics import COUNT, make_topics, parse, prompts
+from yourfeed.pipeline.topics import COUNT, make_topics, mixed, parse, per_update, prompts
 
 
 def test_topic_prompt_follows_the_genre_settings():
@@ -28,3 +28,13 @@ def test_refused_topics_are_empty():
         def complete(self, system, messages, schema):
             return LLMResult("", refused=True)
     assert make_topics(Refuses(), {"name": "思想"}, [])[0] == []
+
+
+def test_each_update_uses_a_topic_for_every_two_candidates():
+    assert [per_update(n) for n in (0, 3, 14, 21, 200)] == [2, 2, 7, 11, COUNT]
+
+
+def test_topics_take_turns_by_language():
+    topics = ["ストア派の倫理", "禅の修行", "儒教とは", "stoic ethics", "zen practice"]
+    assert mixed(topics, ["ja", "en"]) == ["ストア派の倫理", "stoic ethics", "禅の修行", "zen practice", "儒教とは"]
+    assert mixed(topics, None) == topics

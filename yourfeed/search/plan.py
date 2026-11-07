@@ -2,18 +2,31 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 from .language import in_language, language_of, translation_target
+from .searxng import Result
 
-# (SearXNG categories, time range) in the order tried. None means no time limit.
-Window = tuple[str, str | None]
+
+class Window(NamedTuple):
+    """SearXNG categories and time range; results dated before `max_age` are dropped here."""
+    categories: str
+    time_range: str | None = None
+    max_age: timedelta | None = None
+
+
+# SearXNG leaves out the engines that cannot limit by time, which for news is all but one,
+# so news is searched without a time range and old results are dropped instead.
 LATEST_WINDOWS: tuple[Window, ...] = (
-    ("news", "day"), ("news", "week"), ("news", "month"),
-    ("general", "week"), ("general,science", "month"), ("general,science", "year"), ("general,science", None))
-ANY_AGE_WINDOWS: tuple[Window, ...] = (("general", None), ("science", None))
+    Window("news", None, timedelta(days=30)), Window("general", "week"), Window("general,science", "month"),
+    Window("general,science", "year"), Window("general,science"))
+ANY_AGE_WINDOWS: tuple[Window, ...] = (Window("general"), Window("science"))
 MAX_PAGES = 3
+TAKE = 2  # results taken from one query before the next query's turn
 
 
 @dataclass(frozen=True)
@@ -41,14 +54,19 @@ class Site:
 
 @dataclass
 class Stream:
-    """One query, read page by page."""
+    """One query, read page by page. Results of a page wait in `pending` until they are used."""
     query: str
     site: Site | None = None
     discovery: bool = False
     locale: str = "all"
     page: int = 1
-    done: bool = False
+    done: bool = False  # no more pages to search
+    taken: int = 0
     seen: set[str] = field(default_factory=set)
+    pending: deque[Result] = field(default_factory=deque)
+
+    def usable(self, can_search: bool = True) -> bool:
+        return bool(self.pending) or (can_search and not self.done)
 
 
 def _exclusions(terms: list[str]) -> str:
@@ -75,7 +93,8 @@ def terms_for(genre: dict, locale: str) -> tuple[str, list[str], list[str]]:
 
 class GenreSearch:
     """Search state for one genre during one update. Each chosen locale gets an even share of the
-    results and searches with the terms in its language; genres of any age search this update's topics."""
+    results and searches with the terms in its language; genres of any age search this update's topics.
+    Queries take turns, TAKE results at a time, so no single term or topic fills the genre."""
 
     def __init__(self, genre: dict, offset: int = 0) -> None:
         latest = genre.get("latest", True)
@@ -118,34 +137,36 @@ class GenreSearch:
                 [Stream(query, discovery=True, locale=locale) for query in discovery])
         return self._streams[(window, locale)]
 
-    def next_stream(self, window: Window, need: int) -> tuple[Stream, int] | None:
-        """The stream to read next and how many new results to take from it."""
-        open_locales = [locale for locale in self.locales
-                        if any(not stream.done for group in self.streams(window, locale) for stream in group)]
+    def next_stream(self, window: Window, need: int, can_search: bool = True) -> tuple[Stream, int] | None:
+        """The stream to read next and how many new results to take from it. Without `can_search`,
+        only streams with results waiting are used."""
+        groups = {locale: [[stream for stream in group if stream.usable(can_search)]
+                           for group in self.streams(window, locale)] for locale in self.locales}
+        open_locales = [locale for locale in self.locales if any(groups[locale])]
         if not open_locales:
             return None
         locale = min(open_locales, key=lambda locale: self.locale_taken[locale])
-        return self._next_in(window, locale, -(-need // len(open_locales)))
+        return self._next_in(*groups[locale], min(TAKE, -(-need // len(open_locales))))
 
-    def _next_in(self, window: Window, locale: str, need: int) -> tuple[Stream, int] | None:
-        site, focus, discovery = (
-            [stream for stream in group if not stream.done] for group in self.streams(window, locale))
-        first = lambda streams: min(streams, key=lambda stream: stream.page)  # noqa: E731
+    def _next_in(self, site: list[Stream], focus: list[Stream], discovery: list[Stream],
+                 need: int) -> tuple[Stream, int] | None:
+        least = lambda streams: min(streams, key=lambda stream: stream.taken)  # noqa: E731
         if site:
-            return first(site), need
+            return least(site), need
         if not focus and not discovery:
             return None
         if not focus or not discovery:
-            return first(focus or discovery), need
+            return least(focus or discovery), need
         total = self.open_taken + need
         want_discovery = round(self.share * total)
         discovery_limit = min(need, max(0, want_discovery - self.discovery_taken))
         focus_limit = min(need, max(0, total - want_discovery - (self.open_taken - self.discovery_taken)))
         if discovery_limit and (not focus_limit or self.discovery_taken < self.share * (self.open_taken + 1)):
-            return first(discovery), discovery_limit
-        return first(focus), focus_limit
+            return least(discovery), discovery_limit
+        return least(focus), focus_limit
 
     def taken(self, stream: Stream, count: int) -> None:
+        stream.taken += count
         self.locale_taken[stream.locale] = self.locale_taken.get(stream.locale, 0) + count
         if stream.site is None:
             self.open_taken += count

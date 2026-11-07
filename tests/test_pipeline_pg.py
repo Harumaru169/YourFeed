@@ -40,7 +40,8 @@ class FakeSearch:
         else:
             host = "gov.example"
         slug = "q" if "量子" in query else "n"
-        results = [Result(f"https://{host}/{slug}/{time_range}/{page}/{index}", f"{host} {slug} {page}-{index}",
+        window = time_range or categories
+        results = [Result(f"https://{host}/{slug}/{window}/{page}/{index}", f"{host} {slug} {page}-{index}",
                           "説明") for index in range(3)]
         if host == "sci.example" and page == 1:
             results[0] = Result("https://sci.example/hr", "人事のお知らせ", "")
@@ -71,7 +72,7 @@ def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=f"<html lang='zh-CN'><body><article>{body}</article></body></html>".encode(),
                               headers={"Content-Type": "text/html; charset=utf-8"})
     if request.url.host == "gov.example":
-        published = {"/n/day/1/0": "2026-01-01", "/n/day/2/0": ""}.get(request.url.path, published)
+        published = {"/n/news/1/0": "2026-01-01", "/n/news/1/1": ""}.get(request.url.path, published)
     return httpx.Response(200, content=page(f"記事{request.url.path}", published),
                           headers={"Content-Type": "text/html; charset=utf-8"})
 
@@ -207,14 +208,14 @@ def test_every_update_searches_the_candidates_and_fills_the_count(client, engine
     assert {key: value["found"] for key, value in result["genres"].items()} == {
         science["id"]: 9, policy["id"]: 3, next(key for key in result["genres"]
                                                   if key not in (science["id"], policy["id"])): 0}
-    assert search.queries[0] == ("科学 量子 -人事 site:lab.example", 1, "news", "day")
+    assert search.queries[0] == ("科学 量子 -人事 site:lab.example", 1, "news", None)
     assert search.languages == {"ja-JP"}
     with engine.connect() as connection:
         rows = connection.execute(text("""
             SELECT i.url, i.title FROM items i JOIN genres g ON g.id = i.genre_id
             WHERE g.name = '科学' ORDER BY i.rank
         """)).all()
-    assert [url for url, _ in rows[:3]] == [f"https://lab.example/q/day/1/{index}" for index in range(3)]
+    assert [url for url, _ in rows[:3]] == [f"https://lab.example/q/news/1/{index}" for index in range(3)]
     assert not any("人事" in title for _, title in rows)
 
     # 政策's old and undated pages wait for a wider window, so 科学 takes its share.
@@ -233,7 +234,7 @@ def test_every_update_searches_the_candidates_and_fills_the_count(client, engine
         """)).all()
         run = connection.execute(text("SELECT status, target, posted, found, llm_calls, input_tokens FROM runs")).one()
     assert sorted(name for name, _ in posted) == ["政策", "科学", "科学", "科学", "科学", "科学"]
-    assert [url for name, url in posted if name == "政策"] == ["https://gov.example/n/day/2/1"]
+    assert [url for name, url in posted if name == "政策"] == ["https://gov.example/n/news/1/2"]
     assert run == ("ok", 6, 6, 12, 7, 600)
     detail = client.get(f"/v1/timeline/{page['items'][0]['id']}").json()
     assert detail["source"] == "Example" and detail["original_title"].startswith("記事/")
@@ -307,17 +308,17 @@ def test_genres_of_any_age_search_model_topics_and_use_undated_pages(client, eng
     search, llm = DeepSearch(), FakeLLM()
     result = run_cycle(engine, http=fake_http(), llm=llm, searcher=search)
     assert llm.topic_calls == 1
-    assert search.queries[:3] == [("stoa 0 -広告", 1, "general", None), ("stoa 1 -広告", 1, "general", None),
-                                  ("stoa 0 -広告", 2, "general", None)]
+    # One topic for each two candidates, so 6 candidates come from 3 topics.
+    assert search.queries == [(f"stoa {n} -広告", 1, "general", None) for n in range(3)]
     # Undated pages are used at once; the topic call counts as a model call.
     assert (result["found"], result["posted"], result["llm_calls"]) == (6, 3, 5)
     with engine.connect() as connection:
         topics, index = connection.execute(text("SELECT topics, topic_index FROM genres")).one()
-    assert (topics[0], len(topics), index) == ("stoa 0", 30, 2)
+    assert (topics[0], len(topics), index) == ("stoa 0", 30, 3)
 
     search, llm = DeepSearch(), FakeLLM()
     run_cycle(engine, http=fake_http(), llm=llm, searcher=search)
-    assert llm.topic_calls == 0 and search.queries[0][0] == "stoa 2 -広告"
+    assert llm.topic_calls == 0 and search.queries[0][0] == "stoa 3 -広告"
 
     # Switching back to the latest news drops the topics and the unposted candidates.
     client.put(f"/v1/genres/{thought['id']}", json=genre("思想", exclude_terms=["広告"]), headers=SAME_ORIGIN)
@@ -408,3 +409,41 @@ def test_names_and_terms_are_translated_once_for_each_language(client, engine):
     client.put(f"/v1/genres/{space['id']}", json=genre("宇宙", locales=["ja-JP", "en"]), headers=SAME_ORIGIN)
     with engine.connect() as connection:
         assert connection.execute(text("SELECT translations FROM genres")).scalar_one() == {}
+
+
+class PagedSearch:
+    """One page per query: an old result, one from a host that cannot be read, and four usable ones."""
+
+    def __init__(self):
+        self.queries = []
+
+    def search(self, query, *, page=1, categories="general", time_range=None, language="all"):
+        self.queries.append((query, page, categories, time_range))
+        if page > 1:
+            return []
+        return [Result("https://old.example/a", "old", "", NOW - timedelta(days=40)),
+                Result("https://bad.example/a", "bad", ""), Result("https://new.example/a", "a", "", NOW),
+                Result("https://new.example/b", "undated", ""), Result("https://mixed.example/a", "mixed", ""),
+                Result("https://new.example/c", "c", "", NOW)]
+
+
+def test_results_wait_for_their_turn_and_old_or_unreadable_ones_are_dropped(client, engine):
+    space = create(client, "宇宙", 1)
+    with engine.begin() as connection:
+        for host, reasons in (("bad.example", ["http_403", "host_blocked", "too_little_text", "robots_disallow"]),
+                              ("mixed.example", ["too_little_text"] * 3 + [None])):
+            for index, reason in enumerate(reasons):
+                connection.execute(text("""
+                    INSERT INTO items (genre_id, url, title, attempted_at, skip_reason)
+                    VALUES (:genre, :url, 't', now(), :reason)
+                """), {"genre": space["id"], "url": f"https://{host}/old/{index}", "reason": reason})
+        genre = dict(connection.execute(text("SELECT * FROM genres")).mappings().one())
+    search = PagedSearch()
+    collector = run_module.Collector(engine, search, 1, NOW)
+    collector.collect([genre], 4)
+    # The page is searched once; its results are taken two at a time.
+    assert search.queries == [("宇宙", 1, "news", None)]
+    with engine.connect() as connection:
+        urls = connection.execute(text("SELECT url FROM items WHERE run_id = 1 ORDER BY rank")).scalars().all()
+    assert urls == ["https://new.example/a", "https://new.example/b", "https://mixed.example/a",
+                    "https://new.example/c"]

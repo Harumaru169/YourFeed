@@ -21,9 +21,9 @@ from yourfeed.fetch import SafeHttpClient
 from .collect import CANDIDATES, Collector, Searcher
 from .pagetext import RETRYABLE, Page, PageFetcher
 from .prompt import TITLE_MAX, Style
-from .select import by_site, fill_by_weight
+from .select import allocate, by_site, fill_by_weight
 from .summarize import summarize
-from .topics import PER_UPDATE, make_topics
+from .topics import make_topics, per_update
 from .translate import missing, translate_terms
 
 # Age limits for posts, tried in order until the count is filled. None means any age.
@@ -33,6 +33,11 @@ RETRY_AFTER = timedelta(hours=3)
 KEEP_ITEMS = timedelta(days=90)
 MAX_CONSECUTIVE_ERRORS = 3
 CALLS_PER_POST = 8
+
+
+def candidates_for(items_per_run: int) -> int:
+    """New URLs to search for: half again the posts, since some pages cannot be used; at least CANDIDATES."""
+    return max(CANDIDATES, -(-items_per_run * 3 // 2))
 
 
 def load_candidates(connection: Connection, genre_id: Any, now: datetime, window: timedelta | None,
@@ -201,12 +206,12 @@ class _Posting:
                                    {"id": genre["id"], "translations": json.dumps(translations, ensure_ascii=False)})
         return translations
 
-    def search_topics(self, genre: dict[str, Any]) -> list[str]:
-        """This update's topics for a genre of any age; the model makes new ones when they run out."""
+    def search_topics(self, genre: dict[str, Any], count: int) -> list[str]:
+        """This update's `count` topics for a genre of any age; the model makes new ones when they run out."""
         if genre["latest"]:
             return []
         topics, index = list(genre["topics"]), genre["topic_index"]
-        if index + PER_UPDATE > len(topics) and self.llm is not None:
+        if index + count > len(topics) and self.llm is not None:
             try:
                 made, result = make_topics(self.llm, genre, topics)
                 self._count(1, result.input_tokens, result.output_tokens)
@@ -216,7 +221,7 @@ class _Posting:
                     self.llm = None
             if made:
                 topics, index = made, 0
-        picked = topics[index:index + PER_UPDATE]
+        picked = topics[index:index + count]
         with self.engine.begin() as connection:
             connection.execute(text("UPDATE genres SET topics = :topics, topic_index = :index WHERE id = :id"),
                                {"id": genre["id"], "topics": topics, "index": index + len(picked)})
@@ -260,14 +265,15 @@ def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | None, s
             SELECT * FROM genres WHERE weight > 0 ORDER BY position, created_at
         """)).mappings()]
         total = settings["items_per_run"]
+        candidates = candidates_for(total)
         run_id = connection.execute(text("""
             INSERT INTO runs (target, found_target) VALUES (:target, :found_target) RETURNING id
-        """), {"target": total, "found_target": CANDIDATES}).scalar_one()
+        """), {"target": total, "found_target": candidates}).scalar_one()
     detail: dict[str, Any] = {"genres": {}}
     own_http, own_searcher = http is None, searcher is None
     http = http or SafeHttpClient()
     searcher = searcher or Searxng(config.searxng_url())
-    collector = Collector(engine, searcher, run_id)
+    collector = Collector(engine, searcher, run_id, now)
     posting: _Posting | None = None
     try:
         error = None
@@ -278,10 +284,11 @@ def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | None, s
         posting = _Posting(engine, http, client, now, run_id, total * CALLS_PER_POST,
                            {genre["id"]: genre for genre in genres}, settings["retention_hours"])
         posting.error = error
+        shares = allocate({genre["id"]: genre["weight"] for genre in genres}, candidates)
         for genre in genres:
             genre["translations"] = posting.search_terms(genre)
-            genre["search_topics"] = posting.search_topics(genre)
-        found_targets = collector.collect(genres, CANDIDATES)
+            genre["search_topics"] = posting.search_topics(genre, per_update(shares[genre["id"]]))
+        found_targets = collector.collect(genres, candidates)
         found = sum(collector.found.values())
         with engine.begin() as connection:
             connection.execute(text("""
