@@ -132,7 +132,7 @@ class PageFetcher:
             return None, "robots_unavailable"
         if not robots.can_fetch(ROBOTS_AGENT, url):
             return None, "robots_disallow"
-        delay = max(1.0, float(robots.crawl_delay(ROBOTS_AGENT) or 0))
+        delay = min(5.0, max(1.0, float(robots.crawl_delay(ROBOTS_AGENT) or 0)))
         try:
             response = self.http.fetch(url, min_interval=delay, accept=ACCEPT)
         except RateLimited:
