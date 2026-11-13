@@ -18,6 +18,27 @@ NOW = datetime.now(timezone.utc)
 SAME_ORIGIN = {"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"}
 
 
+def test_clear_timeline_preserves_settings_and_rejects_active_worker(engine, client):
+    with engine.begin() as connection:
+        genre = connection.execute(text("INSERT INTO genres (name) VALUES ('科学') RETURNING id")).scalar_one()
+        item = connection.execute(text("INSERT INTO items (genre_id, url, title) VALUES (:genre, 'https://example.com/a', '記事') RETURNING id"), {"genre": genre}).scalar_one()
+        connection.execute(text("INSERT INTO summaries (item_id, title, facts, provider, model) VALUES (:item, '要約', '内容', 'fake', 'fake')"), {"item": item})
+        connection.execute(text("INSERT INTO timeline_entries (item_id, genre_id, title, facts) VALUES (:item, :genre, '要約', '内容')"), {"item": item, "genre": genre})
+        connection.execute(text("INSERT INTO runs DEFAULT VALUES"))
+    with engine.connect() as lock:
+        lock.execute(text("SELECT pg_advisory_lock(:key)"), {"key": WORKER_LOCK})
+        try:
+            assert client.delete('/v1/timeline', headers=SAME_ORIGIN).status_code == 409
+        finally:
+            lock.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK})
+    assert client.delete('/v1/timeline', headers=SAME_ORIGIN).status_code == 204
+    with engine.connect() as connection:
+        for table in ('items', 'summaries', 'timeline_entries'):
+            assert connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 0
+        for table in ('settings', 'genres', 'runs'):
+            assert connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 1
+
+
 class FakeSearch:
     """Three results per page and two pages per query and time range."""
 

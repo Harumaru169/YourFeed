@@ -116,6 +116,7 @@ async function request<T>(path: string, init?: { method: string; body?: unknown 
 export const api = {
   timeline: (cursor?: string) =>
     request<Page>(`/v1/timeline${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
+  clearTimeline: () => request<void>('/v1/timeline', { method: 'DELETE' }),
   item: (id: string) => request<Detail>(`/v1/timeline/${encodeURIComponent(id)}`),
   settings: () => request<Settings>('/v1/settings'),
   saveSettings: (values: SettingsValues) => request<Settings>('/v1/settings', { method: 'PUT', body: values }),

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -50,6 +50,17 @@ def _parse_cursor(cursor: str) -> tuple[datetime, UUID]:
         return parsed, UUID(raw_id)
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, "invalid cursor") from exc
+
+
+@router.delete("/timeline", status_code=204)
+def clear_timeline(engine: Engine = Depends(get_engine)) -> Response:
+    with engine.begin() as connection:
+        locked = connection.execute(text("SELECT pg_try_advisory_xact_lock(:key)"),
+                                    {"key": WORKER_LOCK}).scalar_one()
+        if not locked:
+            raise HTTPException(409, "update in progress")
+        connection.execute(text("DELETE FROM items"))
+    return Response(status_code=204)
 
 
 @router.get("/timeline")

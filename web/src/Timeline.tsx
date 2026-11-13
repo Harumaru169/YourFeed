@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { api } from './api'
+import { api, ApiError } from './api'
 import type { Card, Detail, Run } from './api'
 import { Link, navigate } from './router'
 import { Button, Label, Text } from '@primer/react'
@@ -39,6 +39,11 @@ function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: (
   }, [id])
 
   return <dialog ref={ref} className="detail" aria-labelledby="detail-title"
+    onClick={(event) => {
+      if (event.target !== event.currentTarget) return
+      const { left, right, top, bottom } = event.currentTarget.getBoundingClientRect()
+      if (event.clientX < left || event.clientX > right || event.clientY < top || event.clientY > bottom) onClose()
+    }}
     onCancel={(event) => { event.preventDefault(); onClose() }}>
     <button className="close" onClick={onClose} aria-label="閉じる">×</button>
     {state === 'missing' && <p>表示できません。</p>}
@@ -58,12 +63,46 @@ function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: (
   </dialog>
 }
 
+function ClearDialog({ onClose }: { onClose: () => void }) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { ref.current?.showModal() }, [])
+
+  async function clear() {
+    setBusy(true)
+    setError('')
+    try {
+      await api.clearTimeline()
+      window.location.reload()
+    } catch (cause) {
+      setError(cause instanceof ApiError && cause.status === 409
+        ? '更新中はクリアできません。更新が終わってからお試しください。'
+        : 'クリアできませんでした。もう一度お試しください。')
+      setBusy(false)
+    }
+  }
+
+  return <dialog ref={ref} className="detail" aria-labelledby="clear-title"
+    onCancel={(event) => { event.preventDefault(); if (!busy) onClose() }}>
+    <h2 id="clear-title">キャッシュをクリアしますか？</h2>
+    <p>記事候補、要約、表示中のカードを削除します。設定とジャンルは残ります。</p>
+    <p>次の更新で同じ記事が再び表示されることがあります。</p>
+    {error && <p className="message" role="alert">{error}</p>}
+    <div className="clear-actions">
+      <Button onClick={onClose} disabled={busy}>キャンセル</Button>
+      <Button variant="danger" onClick={() => void clear()} disabled={busy}>{busy ? 'クリア中…' : 'クリアする'}</Button>
+    </div>
+  </dialog>
+}
+
 export default function Timeline({ path }: { path: string }) {
   const [cards, setCards] = useState<Card[]>([])
   const [busy, setBusy] = useState(false)
   const [done, setDone] = useState(false)
   const [error, setError] = useState(false)
   const [lastRun, setLastRun] = useState<Run | null>()
+  const [confirmClear, setConfirmClear] = useState(false)
   const cursor = useRef<string | null>(null)
   const seen = useRef(new Set<string>())
   const inFlight = useRef(false)
@@ -166,7 +205,10 @@ export default function Timeline({ path }: { path: string }) {
         {lastRun === undefined ? '' : lastRun === null ? '未更新' : lastRun.status === 'running' ? '更新中'
           : `最終更新：${updateFormat.format(new Date(lastRun.finished_at ?? lastRun.started_at))}`}
       </Text>
-      <Link to="/settings" button>設定</Link>
+      <div className="feed-actions">
+        <Button onClick={() => setConfirmClear(true)}>キャッシュをクリア</Button>
+        <Link to="/settings" button>設定</Link>
+      </div>
     </nav>
     <section className="cards">
       {cards.map((card) => <PrimerCard className="feed-card" key={card.id}>
@@ -181,5 +223,6 @@ export default function Timeline({ path }: { path: string }) {
     </div>}
     <div ref={sentinel} className="end" />
     <DetailDialog id={detailId} onClose={close} onClosed={restore} />
+    {confirmClear && <ClearDialog onClose={() => setConfirmClear(false)} />}
   </main>
 }
