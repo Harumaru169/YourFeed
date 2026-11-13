@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -52,18 +53,41 @@ Term = Annotated[str, StringConstraints(max_length=60)]
 Terms = Annotated[list[Term], AfterValidator(_unique), Field(max_length=50)]
 
 
+Provider = Literal["openai", "anthropic", "claude_cli", "codex_cli", "gemini_cli"]
+Model = Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
+MAX_FALLBACKS = 4
+
+
+class Backend(BaseModel):
+    provider: Provider
+    model: Model = ""
+
+
 class SettingsIn(BaseModel):
     interval_minutes: Literal[15, 30, 60, 120, 180, 360, 720, 1440]
     items_per_run: int = Field(ge=1, le=50)
     retention_hours: int = Field(ge=1, le=168)
-    llm_provider: Literal["openai", "anthropic", "claude_cli", "codex_cli", "gemini_cli"]
-    llm_model: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)] = ""
+    llm_provider: Provider
+    llm_model: Model = ""
+    # Used in order when the one before cannot be used in an update.
+    llm_fallbacks: list[Backend] = Field(default_factory=list, max_length=MAX_FALLBACKS)
 
     @model_validator(mode="after")
     def _retention(self) -> SettingsIn:
         # Shorter than the interval, the timeline would be empty until the next update.
         if self.retention_hours * 60 < self.interval_minutes:
             raise ValueError("retention_hours must cover the interval")
+        return self
+
+    @model_validator(mode="after")
+    def _unique_backends(self) -> SettingsIn:
+        seen = {(self.llm_provider, self.llm_model)}
+        unique = []
+        for backend in self.llm_fallbacks:
+            if (backend.provider, backend.model) not in seen:
+                seen.add((backend.provider, backend.model))
+                unique.append(backend)
+        self.llm_fallbacks = unique
         return self
 
 
@@ -111,14 +135,15 @@ def get_settings(engine: Engine = Depends(get_engine)) -> dict:
     with engine.connect() as connection:
         row = dict(connection.execute(text("SELECT * FROM settings WHERE id = 1")).mappings().one())
         run = connection.execute(text("""
-            SELECT started_at, finished_at, status, target, posted, found, found_target, error, search_error
+            SELECT started_at, finished_at, status, target, posted, found, found_target, error, search_error,
+              COALESCE(detail->'switches', '[]') AS switches
             FROM runs ORDER BY started_at DESC LIMIT 1
         """)).mappings().one_or_none()
         genres = _genre_rows(connection)
     return {
         "interval_minutes": row["interval_minutes"], "items_per_run": row["items_per_run"],
         "retention_hours": row["retention_hours"], "llm_provider": row["llm_provider"],
-        "llm_model": row["llm_model"], "default_models": DEFAULT_MODELS,
+        "llm_model": row["llm_model"], "llm_fallbacks": row["llm_fallbacks"], "default_models": DEFAULT_MODELS,
         "openai_base_url": config.openai_base_url(),
         "keys": {"openai": config.api_key("openai") is not None,
                  "anthropic": config.api_key("anthropic") is not None},
@@ -135,9 +160,9 @@ def put_settings(body: SettingsIn, engine: Engine = Depends(get_engine)) -> dict
         connection.execute(text("""
             UPDATE settings SET interval_minutes = :interval_minutes, items_per_run = :items_per_run,
               retention_hours = :retention_hours, llm_provider = :llm_provider, llm_model = :llm_model,
-              updated_at = now()
+              llm_fallbacks = CAST(:llm_fallbacks AS jsonb), updated_at = now()
             WHERE id = 1
-        """), body.model_dump())
+        """), {**body.model_dump(), "llm_fallbacks": json.dumps([backend.model_dump() for backend in body.llm_fallbacks])})
     return get_settings(engine)
 
 

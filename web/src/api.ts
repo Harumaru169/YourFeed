@@ -26,12 +26,25 @@ export interface Page {
 
 export type Provider = 'openai' | 'anthropic' | 'claude_cli' | 'codex_cli' | 'gemini_cli'
 
+export interface Backend {
+  provider: Provider
+  model: string
+}
+
 export interface SettingsValues {
   interval_minutes: number
   items_per_run: number
   retention_hours: number
   llm_provider: Provider
   llm_model: string
+  llm_fallbacks: Backend[]
+}
+
+/** A provider an update gave up on, why, and the one it went on with (null: none left). */
+export interface Switch {
+  from: Provider
+  error: string
+  to: Provider | null
 }
 
 export interface Run {
@@ -44,6 +57,7 @@ export interface Run {
   found_target: number
   error: string | null
   search_error: string | null
+  switches: Switch[]
 }
 
 export interface GenreRow {

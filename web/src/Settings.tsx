@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
-import type { GenreRow, Provider, Run, Settings as SettingsData, SettingsValues } from './api'
+import type { Backend, GenreRow, Provider, Run, Settings as SettingsData, SettingsValues, Switch } from './api'
 import { Link } from './router'
 
 const INTERVALS: [number, string][] = [[15, '15分'], [30, '30分'], [60, '1時間'], [120, '2時間'],
@@ -9,6 +9,8 @@ const RETENTION: [number, string][] = [[6, '6時間'], [12, '12時間'], [24, '2
   [72, '3日'], [168, '7日']]
 const PROVIDERS: [Provider, string][] = [['openai', 'OpenAI互換API'], ['anthropic', 'Claude API'],
   ['claude_cli', 'Claude Code'], ['codex_cli', 'Codex'], ['gemini_cli', 'Gemini CLI']]
+const MAX_BACKENDS = 5
+const providerName = (provider: Provider | null) => PROVIDERS.find(([value]) => value === provider)?.[1] ?? provider ?? ''
 const ERRORS: Record<string, string> = {
   no_model: 'モデル未設定',
   http_400: 'AIがリクエストを拒否',
@@ -33,19 +35,32 @@ const ERRORS: Record<string, string> = {
 const timeFormat = new Intl.DateTimeFormat('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 
 type Section = 'genres' | 'update' | 'ai'
-type Form = { [K in keyof SettingsValues]: string }
+/** The update settings as typed, and the providers in the order they are tried. */
+type Form = { interval_minutes: string; items_per_run: string; retention_hours: string; backends: Backend[] }
+type TextKey = Exclude<keyof Form, 'backends'>
 
 const toForm = (settings: SettingsValues): Form => ({
   interval_minutes: String(settings.interval_minutes), items_per_run: String(settings.items_per_run),
-  retention_hours: String(settings.retention_hours), llm_provider: settings.llm_provider,
-  llm_model: settings.llm_model,
+  retention_hours: String(settings.retention_hours),
+  backends: [{ provider: settings.llm_provider, model: settings.llm_model }, ...settings.llm_fallbacks],
 })
 
-const toValues = (form: Form): SettingsValues => ({
-  interval_minutes: Number(form.interval_minutes), items_per_run: Number(form.items_per_run),
-  retention_hours: Number(form.retention_hours), llm_provider: form.llm_provider as Provider,
-  llm_model: form.llm_model.trim(),
-})
+function toValues(form: Form): SettingsValues {
+  const [main, ...fallbacks] = form.backends.map((backend) => ({ ...backend, model: backend.model.trim() }))
+  return {
+    interval_minutes: Number(form.interval_minutes), items_per_run: Number(form.items_per_run),
+    retention_hours: Number(form.retention_hours), llm_provider: main.provider, llm_model: main.model,
+    llm_fallbacks: fallbacks,
+  }
+}
+
+/** "Claude Code（AIの利用制限） → Codex": the providers an update gave up on and the one it went on with. */
+function switchText(switches: Switch[]): string {
+  if (!switches.length) return ''
+  const chain = switches.map((step) => `${providerName(step.from)}（${ERRORS[step.error] ?? step.error}）`)
+  const last = switches[switches.length - 1].to
+  return `　${chain.join(' → ')} → ${last ? providerName(last) : 'AIなし'}`
+}
 
 /** Posts per update for each genre: largest remainder over genres that have a weight. */
 function planned(genres: GenreRow[], weights: Record<string, string>, total: number): Record<string, number> {
@@ -67,8 +82,10 @@ function runText(run: Run | null): string {
   if (!run) return '未更新'
   if (run.status === 'running') return '更新中'
   const when = timeFormat.format(new Date(run.finished_at ?? run.started_at))
-  const errors = [run.search_error, run.error].filter((code): code is string => Boolean(code))
-  const problem = errors.map((code) => `　${ERRORS[code] ?? code}`).join('')
+  const switches = run.switches ?? []
+  // A switch already names the error that caused it.
+  const errors = [run.search_error, switches.length ? null : run.error].filter((code): code is string => Boolean(code))
+  const problem = errors.map((code) => `　${ERRORS[code] ?? code}`).join('') + switchText(switches)
   if (run.status === 'error') return `${when}　失敗${problem}`
   const count = run.posted < run.target ? `${run.posted}/${run.target}件` : `${run.posted}件`
   const found = run.found < run.found_target ? `　候補 ${run.found}/${run.found_target}` : ''
@@ -128,12 +145,14 @@ export default function Settings() {
       saved.current = toForm(result)
       setData(result)
       setFailed(null)
+      // The server drops a provider listed twice.
+      if (section === 'ai') setForm((current) => current && { ...current, backends: toForm(result).backends })
     } catch {
       setFailed(section)
     }
   }
 
-  const change = (key: keyof Form, section: Section, now = false) =>
+  const change = (key: TextKey, section: Section, now = false) =>
     (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
       const next = key === 'interval_minutes' ? withInterval(form, event.target.value)
         : { ...form, [key]: event.target.value }
@@ -141,6 +160,24 @@ export default function Settings() {
       if (now) void commit(next, section)
     }
   const blur = (section: Section) => () => { if (form) void commit(form, section) }
+
+  const setBackends = (backends: Backend[], now: boolean) => {
+    const next = { ...form, backends }
+    setForm(next)
+    if (now) void commit(next, 'ai')
+  }
+  const editBackend = (index: number, patch: Partial<Backend>, now: boolean) =>
+    setBackends(form.backends.map((backend, position) => position === index ? { ...backend, ...patch } : backend), now)
+  const addBackend = () => {
+    const unused = PROVIDERS.find(([value]) => !form.backends.some((backend) => backend.provider === value))?.[0]
+    setBackends([...form.backends, { provider: unused ?? 'openai', model: '' }], true)
+  }
+  const raiseBackend = (index: number) => {
+    const backends = [...form.backends];
+    [backends[index - 1], backends[index]] = [backends[index], backends[index - 1]]
+    setBackends(backends, true)
+  }
+  const removeBackend = (index: number) => setBackends(form.backends.filter((_, position) => position !== index), true)
 
   async function saveWeight(genre: GenreRow) {
     const value = Number(weights[genre.id])
@@ -182,8 +219,8 @@ export default function Settings() {
     }, 5000)
   }
 
-  const provider = form.llm_provider as Provider
-  const counts = planned(data.genres, weights, Number(form.items_per_run) || 0)
+  const uses = (provider: Provider) => form.backends.some((backend) => backend.provider === provider)
+  const counts =planned(data.genres, weights, Number(form.items_per_run) || 0)
   const heading = (title: string, section: Section) => <div className="group-head">
     <h2>{title}</h2>
     {failed === section && <span className="message" role="alert">保存できません</span>}
@@ -230,21 +267,36 @@ export default function Settings() {
 
     <form className="group" data-section="ai" onSubmit={(event) => event.preventDefault()}>
       {heading('AI', 'ai')}
-      <label className="field"><span>接続先</span>
-        <select value={form.llm_provider} onChange={change('llm_provider', 'ai', true)}>
-          {PROVIDERS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-        </select>
-      </label>
-      <label className="field"><span>モデル</span>
-        <input className="text" spellCheck={false} value={form.llm_model} placeholder={data.default_models[provider] ?? ''}
-          onChange={change('llm_model', 'ai')} onBlur={blur('ai')} onKeyDown={blurOnEnter} />
-      </label>
-      {provider === 'openai' && <div className="field"><span>URL</span>
+      <ol className="backends">
+        {form.backends.map((backend, index) => <li key={index}>
+          <label className="field"><span>{index === 0 ? '接続先' : `切り替え先${index}`}</span>
+            <select value={backend.provider}
+              onChange={(event) => editBackend(index, { provider: event.target.value as Provider, model: '' }, true)}>
+              {PROVIDERS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </label>
+          <label className="field"><span>モデル</span>
+            <input className="text" spellCheck={false} value={backend.model}
+              placeholder={data.default_models[backend.provider] ?? ''}
+              onChange={(event) => editBackend(index, { model: event.target.value }, false)}
+              onBlur={blur('ai')} onKeyDown={blurOnEnter} />
+          </label>
+          {index > 0 && <div className="backend-actions">
+            <button type="button" onClick={() => raiseBackend(index)}>上へ</button>
+            <button type="button" onClick={() => removeBackend(index)}>削除</button>
+          </div>}
+        </li>)}
+      </ol>
+      {form.backends.length < MAX_BACKENDS && <button type="button" className="button" onClick={addBackend}>
+        切り替え先を追加</button>}
+      <p className="note">上の接続先が利用の上限やログイン切れなどで使えなくなると、その更新の間は次の切り替え先を使います。</p>
+      {uses('openai') && <div className="field"><span>URL</span>
         <span className="value url">{data.openai_base_url}</span>
       </div>}
-      {(provider === 'openai' || provider === 'anthropic') && <div className="field"><span>APIキー</span>
+      {(['openai', 'anthropic'] as const).filter(uses).map((provider) => <div className="field" key={provider}>
+        <span>{provider === 'openai' ? 'APIキー' : 'Claude APIキー'}</span>
         <span className="value">{data.keys[provider] ? '設定済み' : '未設定'}</span>
-      </div>}
+      </div>)}
     </form>
 
     <section className="group status">

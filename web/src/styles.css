@@ -103,6 +103,12 @@ p { margin: 0; }
 
 .status { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 
+.backends { margin: 0 0 16px; padding: 0; list-style: none; }
+.backends li + li { padding-top: 14px; border-top: 1px solid #ccc; }
+.backend-actions { display: flex; gap: 8px; margin: -4px 0 14px calc(7.5rem + 12px); }
+.backend-actions button { padding: 4px 12px; border: 1px solid #111; background: #fff; }
+.note { margin: 12px 0; font-size: 14px; }
+
 @media (max-width: 600px) {
   .page { padding: 12px 12px 64px; }
   .card-open { padding: 18px; }
@@ -113,4 +119,5 @@ p { margin: 0; }
   .field select, .field input.text { max-width: none; }
   .field-top > span:first-child { padding-top: 0; }
   .field-note { margin-left: 0; }
+  .backend-actions { margin-left: 0; }
 }

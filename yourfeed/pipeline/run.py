@@ -71,10 +71,27 @@ def load_candidates(connection: Connection, genre_id: Any, now: datetime, window
            "retry_before": now - RETRY_AFTER}).mappings()]
 
 
+Backend = tuple[str, "LLMClient | LLMError"]  # a provider, and its client or why it could not be set up
+
+
+def make_clients(settings: dict[str, Any]) -> list[Backend]:
+    """The main provider, then the fallbacks, in the order they are tried."""
+    backends = [{"provider": settings["llm_provider"], "model": settings["llm_model"]},
+                *(settings.get("llm_fallbacks") or [])]
+    clients: list[Backend] = []
+    for backend in backends:
+        try:
+            clients.append((backend["provider"],
+                            make_client({"llm_provider": backend["provider"], "llm_model": backend["model"]})))
+        except LLMError as exc:
+            clients.append((backend["provider"], exc))
+    return clients
+
+
 class _Posting:
-    def __init__(self, engine: Engine, http: SafeHttpClient, llm: LLMClient | None, now: datetime,
+    def __init__(self, engine: Engine, http: SafeHttpClient, clients: list[Backend], now: datetime,
                  run_id: int, call_cap: int, genres: dict[Any, dict[str, Any]], retention_hours: int) -> None:
-        self.engine, self.llm, self.now = engine, llm, now
+        self.engine, self.now = engine, now
         self.run_id, self.call_cap, self.genres, self.retention_hours = run_id, call_cap, genres, retention_hours
         self.posted = 0
         self.queues: dict[tuple[Any, int], deque[dict[str, Any]]] = {}
@@ -85,6 +102,35 @@ class _Posting:
         self.tried: set[Any] = set()
         self.pages: dict[Any, Page] = {}
         self.accepted: dict[Any, list[Any]] = {genre_id: [] for genre_id in genres}
+        self.clients = clients
+        self.llm: LLMClient | None = None
+        self.switches: list[dict[str, str | None]] = []  # each provider given up on, why, and the next one
+        self._use(0)
+
+    def _use(self, index: int, failed: tuple[str, str] | None = None) -> None:
+        """Use the first client from `index` on that could be set up, noting each provider passed over."""
+        given_up = [failed] if failed else []
+        while index < len(self.clients) and isinstance(self.clients[index][1], LLMError):
+            provider, error = self.clients[index]
+            given_up.append((provider, error.code))
+            self.error = error.code
+            index += 1
+        self.index = index
+        self.llm = self.clients[index][1] if index < len(self.clients) else None  # type: ignore[assignment]
+        for position, (provider, code) in enumerate(given_up):
+            following = given_up[position + 1][0] if position + 1 < len(given_up) else \
+                (self.clients[index][0] if index < len(self.clients) else None)
+            self.switches.append({"from": provider, "error": code, "to": following})
+
+    def _failed(self, exc: LLMError) -> bool:
+        """Count a failed call. A provider that cannot be used hands over to the next; True if it did."""
+        self.error = exc.code
+        self.consecutive_errors += 1
+        if not (exc.fatal or exc.code == "http_429" or self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS):
+            return False
+        self.consecutive_errors = 0
+        self._use(self.index + 1, failed=(self.clients[self.index][0], exc.code))
+        return True
 
     def _mark_attempted(self, item_id: Any, reason: str) -> None:
         with self.engine.begin() as connection:
@@ -137,11 +183,8 @@ class _Posting:
             outcome = summarize(self.llm, style, source_name=site_name, title=title,
                                 published_at=published_at, body=page.text)
         except LLMError as exc:
-            self.error = exc.code
-            self.consecutive_errors += 1
-            if exc.fatal or self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                self.llm = None
-            return "no"
+            # The page is tried again with the next provider when this one cannot be used.
+            return "retry" if self._failed(exc) else "no"
         self.consecutive_errors = 0
         self._count(outcome.calls, outcome.input_tokens, outcome.output_tokens)
         if outcome.status != "ok" or outcome.summary is None:
@@ -191,6 +234,9 @@ class _Posting:
                 result = self._summarize(genre, row, window)
             else:
                 continue
+            if result == "retry":
+                queue.appendleft(row)
+                continue
             if result != "later":  # an undated page is tried again in the next window
                 self.tried.add(row["id"])
             if result == "ok":
@@ -202,16 +248,17 @@ class _Posting:
         """The genre's name and terms in each chosen language; the model translates the missing ones."""
         translations = dict(genre["translations"] or {})
         languages = missing(genre)
-        if not languages or self.llm is None:
-            return translations
-        try:
-            made, result = translate_terms(self.llm, genre, languages)
+        made: dict[str, dict[str, Any]] = {}
+        while languages and self.llm is not None:
+            try:
+                made, result = translate_terms(self.llm, genre, languages)
+            except LLMError as exc:
+                if self._failed(exc):
+                    continue
+                return translations
+            self.consecutive_errors = 0
             self._count(1, result.input_tokens, result.output_tokens)
-        except LLMError as exc:
-            self.error = exc.code
-            if exc.fatal:
-                self.llm = None
-            return translations
+            break
         if made:
             translations.update(made)
             with self.engine.begin() as connection:
@@ -224,16 +271,19 @@ class _Posting:
         if genre["latest"]:
             return []
         topics, index = list(genre["topics"]), genre["topic_index"]
-        if index + count > len(topics) and self.llm is not None:
+        made: list[str] = []
+        while index + count > len(topics) and self.llm is not None:
             try:
                 made, result = make_topics(self.llm, genre, topics)
-                self._count(1, result.input_tokens, result.output_tokens)
             except LLMError as exc:
-                made, self.error = [], exc.code
-                if exc.fatal:
-                    self.llm = None
-            if made:
-                topics, index = made, 0
+                if self._failed(exc):
+                    continue
+                break
+            self.consecutive_errors = 0
+            self._count(1, result.input_tokens, result.output_tokens)
+            break
+        if made:
+            topics, index = made, 0
         picked = topics[index:index + count]
         with self.engine.begin() as connection:
             connection.execute(text("UPDATE genres SET topics = :topics, topic_index = :index WHERE id = :id"),
@@ -258,8 +308,10 @@ def close_interrupted(engine: Engine) -> None:
             lock.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK})
 
 
-def run_cycle(engine: Engine, *, http: SafeHttpClient | None = None, llm: LLMClient | None = None,
-              searcher: Searcher | None = None, now: datetime | None = None) -> dict[str, Any]:
+def run_cycle(engine: Engine, *, http: SafeHttpClient | None = None,
+              llm: LLMClient | list[LLMClient] | None = None, searcher: Searcher | None = None,
+              now: datetime | None = None) -> dict[str, Any]:
+    """One update. `llm` replaces the configured providers: one client, or several tried in order."""
     with engine.connect() as lock:
         if not lock.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": WORKER_LOCK}).scalar_one():
             return {"status": "busy"}
@@ -269,8 +321,8 @@ def run_cycle(engine: Engine, *, http: SafeHttpClient | None = None, llm: LLMCli
             lock.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK})
 
 
-def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | None, searcher: Searcher | None,
-           now: datetime) -> dict[str, Any]:
+def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | list[LLMClient] | None,
+           searcher: Searcher | None, now: datetime) -> dict[str, Any]:
     with engine.begin() as connection:
         connection.execute(text(CLOSE_INTERRUPTED))  # the lock is held, so no other run is going on
         settings = dict(connection.execute(text("SELECT * FROM settings WHERE id = 1")).mappings().one())
@@ -290,14 +342,10 @@ def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | None, s
     posting: _Posting | None = None
     try:
         forget_old(engine, now)
-        error = None
-        try:
-            client = llm or make_client(settings)
-        except LLMError as exc:
-            client, error = None, exc.code
-        posting = _Posting(engine, http, client, now, run_id, total * CALLS_PER_POST,
+        given = [llm] if llm is not None and not isinstance(llm, list) else llm
+        clients = [(client.provider, client) for client in given] if given is not None else make_clients(settings)
+        posting = _Posting(engine, http, clients, now, run_id, total * CALLS_PER_POST,
                            {genre["id"]: genre for genre in genres}, settings["retention_hours"])
-        posting.error = error
         shares = allocate({genre["id"]: genre["weight"] for genre in genres}, candidates)
         for genre in genres:
             genre["translations"] = posting.search_terms(genre)
@@ -339,7 +387,8 @@ def _finish(engine: Engine, run_id: int, status: str, posted: int, posting: _Pos
         """), {"id": run_id, "status": status, "posted": posted, "error": error,
                "calls": posting.calls if posting else 0, "input": posting.input_tokens if posting else 0,
                "output": posting.output_tokens if posting else 0,
-               "detail": json.dumps(detail, ensure_ascii=False, default=str)})
+               "detail": json.dumps({**detail, "switches": posting.switches if posting else []},
+                                    ensure_ascii=False, default=str)})
 
 
 def publish(engine: Engine, posts: list[tuple[Any, Any]], retention_hours: int) -> int:

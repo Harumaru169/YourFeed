@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from yourfeed.db import WORKER_LOCK, get_engine
 from yourfeed.fetch import SafeHttpClient
-from yourfeed.llm import LLMResult
+from yourfeed.llm import LLMError, LLMResult
 from yourfeed.main import app
 from yourfeed.pipeline import run as run_module
 from yourfeed.pipeline.run import close_interrupted, forget_old, publish, run_cycle
@@ -144,6 +144,14 @@ def test_settings_api_validates_and_guards_requests(client, engine):
     assert client.put("/v1/settings", json={**body, "interval_minutes": 7}, headers=SAME_ORIGIN).status_code == 422
     assert client.put("/v1/settings", json={**body, "items_per_run": 51}, headers=SAME_ORIGIN).status_code == 422
     assert client.put("/v1/settings", json={**body, "items_per_run": 4}, headers=SAME_ORIGIN).json()["items_per_run"] == 4
+    # Providers to switch to: one listed twice, or the same as the main one, is dropped; four at most.
+    saved = client.put("/v1/settings", json={**body, "llm_provider": "claude_cli", "llm_model": "", "llm_fallbacks": [
+        {"provider": "codex_cli"}, {"provider": "claude_cli", "model": ""}, {"provider": "codex_cli", "model": " "}]},
+        headers=SAME_ORIGIN).json()
+    assert (saved["llm_provider"], saved["llm_fallbacks"]) == ("claude_cli", [{"provider": "codex_cli", "model": ""}])
+    assert client.put("/v1/settings", json={**body, "llm_fallbacks": [{"provider": "openai", "model": str(n)}
+                                                                      for n in range(5)]},
+                      headers=SAME_ORIGIN).status_code == 422
     # The display period covers the interval, or the timeline would be empty until the next update.
     assert client.put("/v1/settings", json={**body, "interval_minutes": 1440, "retention_hours": 12},
                       headers=SAME_ORIGIN).status_code == 422
@@ -517,3 +525,39 @@ def test_old_data_is_forgotten(client, engine):
     assert left == {"candidate-new", "failed-new", "posted-new", "on-timeline"}
     # Posts off the timeline keep only their URL; the newest run stays however old it is.
     assert summaries == {"on-timeline"} and runs == 2
+
+
+def test_a_provider_that_cannot_be_used_hands_over_to_the_next(client, engine, monkeypatch):
+    monkeypatch.setattr(run_module, "CANDIDATES", 4)
+    client.put("/v1/settings", json=settings_body(client, items_per_run=2), headers=SAME_ORIGIN)
+    create(client, "宇宙", 1)
+
+    class Limited(FakeLLM):
+        provider, model = "claude_cli", "claude-opus-5-5"
+
+        def complete(self, system, messages, schema):
+            self.calls += 1
+            raise LLMError("http_429")
+
+    limited, fallback = Limited(), FakeLLM()
+    result = run_cycle(engine, http=fake_http(), llm=[limited, fallback], searcher=MixedSearch())
+    # The first page hits the limit, so it and the rest are summarized by the next provider.
+    assert (result["posted"], limited.calls) == (2, 1)
+    with engine.connect() as connection:
+        providers = connection.execute(text("SELECT DISTINCT provider FROM summaries")).scalars().all()
+        retried = connection.execute(text("""
+            SELECT count(*) FROM items WHERE url LIKE 'https://jp.example/%' AND posted_at IS NOT NULL
+        """)).scalar_one()
+    assert providers == ["fake"] and retried == 2
+    switches = [{"from": "claude_cli", "error": "http_429", "to": "fake"}]
+    assert client.get("/v1/settings").json()["last_run"]["switches"] == switches
+
+    # With none left, the update ends without summaries and says which providers it gave up on.
+    class Newer:
+        def search(self, query, *, page=1, categories="general", time_range=None, language="all"):
+            return [Result(f"https://jp2.example/{index}", f"jp2 {index}", "") for index in range(2)] if page == 1 else []
+
+    result = run_cycle(engine, http=fake_http(), llm=[Limited()], searcher=Newer())
+    assert result["posted"] == 0
+    assert client.get("/v1/settings").json()["last_run"]["switches"] == [
+        {"from": "claude_cli", "error": "http_429", "to": None}]

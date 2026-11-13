@@ -189,3 +189,21 @@ def test_gemini_cli_auth_errors_are_fatal(tmp_path):
     with pytest.raises(LLMError) as caught:
         GeminiCliClient("", executable).complete("sys", MESSAGES, SCHEMA)
     assert (caught.value.code, caught.value.fatal) == ("cli_login", True)
+
+
+def test_providers_that_cannot_be_set_up_are_passed_over():
+    from datetime import datetime, timezone
+
+    from yourfeed.llm.claude_cli import ClaudeCliClient
+    from yourfeed.pipeline.run import _Posting, make_clients
+    clients = make_clients({"llm_provider": "openai", "llm_model": " ",
+                            "llm_fallbacks": [{"provider": "claude_cli", "model": ""}]})
+    assert [(provider, type(client).__name__) for provider, client in clients] == [
+        ("openai", "LLMError"), ("claude_cli", "ClaudeCliClient")]
+    posting = _Posting(None, None, clients, datetime.now(timezone.utc), 1, 8, {}, 24)
+    assert isinstance(posting.llm, ClaudeCliClient) and posting.error == "no_model"
+    assert posting.switches == [{"from": "openai", "error": "no_model", "to": "claude_cli"}]
+    # Two failures in a row are not enough to give up on a provider; a login problem is.
+    assert not posting._failed(LLMError("timeout")) and not posting._failed(LLMError("timeout"))
+    assert posting._failed(LLMError("cli_login", fatal=True)) and posting.llm is None
+    assert posting.switches[-1] == {"from": "claude_cli", "error": "cli_login", "to": None}
