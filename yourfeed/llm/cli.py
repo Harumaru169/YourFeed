@@ -65,10 +65,17 @@ def limit_reached(text: str) -> bool:
 
 
 def cli_failure(text: str, fatal: bool = False) -> LLMError:
-    """The error for a failed CLI call: the usage limit, or a CLI error (fatal when not logged in)."""
+    """The error for a failed CLI call: the usage limit, no login, or another CLI error."""
     if limit_reached(text):
         return LLMError("http_429")
-    return LLMError("cli_error", fatal=fatal or login_problem(text))
+    if login_problem(text):
+        return LLMError("cli_login", fatal=True)
+    return LLMError("cli_error", fatal=fatal)
+
+
+def unreadable_reply(text: str) -> LLMError:
+    """The error for output that is not the CLI's JSON, which is often a login prompt."""
+    return LLMError("cli_login", fatal=True) if login_problem(text) else LLMError("unexpected_response")
 
 
 def login_problem(text: str) -> bool:

@@ -18,6 +18,7 @@ const ERRORS: Record<string, string> = {
   http_429: 'AIの利用制限',
   cli_not_found: 'CLIが見つかりません',
   cli_error: 'CLIでエラー',
+  cli_login: 'CLIにログインしていません',
   unexpected_response: 'AIの応答を読めません',
   unknown_provider: '接続先が不明',
   connection_error: 'AIに接続できません',

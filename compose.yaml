@@ -1,6 +1,9 @@
 x-app: &app
   image: yourfeed
-  build: .
+  build:
+    context: .
+    args:
+      CLIS: ${YOURFEED_CLIS:-}
   environment:
     DATABASE_URL: postgresql://yourfeed:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/yourfeed
     YOURFEED_ALLOWED_HOSTS: ${YOURFEED_ALLOWED_HOSTS:-}
@@ -9,6 +12,7 @@ x-app: &app
     OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
     SEARXNG_URL: http://searxng:8080
   extra_hosts:
     - "host.docker.internal:host-gateway"
@@ -60,6 +64,8 @@ services:
   worker:
     <<: *app
     command: ["python", "-m", "yourfeed.worker"]
+    volumes:
+      - cli-home:/home/yourfeed  # logins of the subscription CLIs
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -68,3 +74,4 @@ services:
 
 volumes:
   db:
+  cli-home:

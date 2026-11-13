@@ -103,11 +103,26 @@ def test_cli_usage_limits_are_reported_as_limits(tmp_path):
     for reply, code, fatal in (
             ({"is_error": True, "subtype": "success", "result": "Claude AI usage limit reached · resets 3pm"}, "http_429", False),
             ({"is_error": True, "api_error_status": 429, "result": "x"}, "http_429", False),
-            ({"is_error": True, "subtype": "success", "result": "Not logged in"}, "cli_error", True),
+            ({"is_error": True, "subtype": "success", "result": "Not logged in · Please run /login"}, "cli_login", True),
             ({"is_error": True, "subtype": "success", "result": "API Error: 500"}, "cli_error", False)):
         with pytest.raises(LLMError) as caught:
             claude(reply).complete("sys", MESSAGES, SCHEMA)
         assert (caught.value.code, caught.value.fatal) == (code, fatal)
+
+
+def test_claude_cli_gets_only_the_subscription_token(tmp_path, monkeypatch):
+    seen = tmp_path / "env.txt"
+    executable = fake_cli(tmp_path, "claude", (
+        f'cat > /dev/null\necho "token=$CLAUDE_CODE_OAUTH_TOKEN key=$ANTHROPIC_API_KEY" > {seen}\n'
+        "echo '" + json.dumps({"is_error": False, "structured_output": REPLY, "usage": {}}) + "'\n"))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")  # would bill the API instead of the plan
+    ClaudeCliClient("m", executable).complete("sys", MESSAGES, SCHEMA)
+    assert seen.read_text().strip() == "token=sk-ant-oat-test key="
+    with pytest.raises(LLMError) as caught:  # a login prompt instead of JSON
+        ClaudeCliClient("m", fake_cli(tmp_path, "claude", "cat > /dev/null\necho 'Invalid API key · Please run /login'\n")
+                        ).complete("sys", MESSAGES, SCHEMA)
+    assert (caught.value.code, caught.value.fatal) == ("cli_login", True)
 
 
 def test_make_client_needs_a_model_for_openai(monkeypatch):
@@ -150,7 +165,7 @@ def test_codex_cli_login_failures_are_fatal(tmp_path):
     executable = fake_cli(tmp_path, "codex", "cat > /dev/null\necho 'Not logged in' >&2\nexit 1\n")
     with pytest.raises(LLMError) as caught:
         CodexCliClient("", executable).complete("sys", MESSAGES, SCHEMA)
-    assert caught.value.fatal
+    assert (caught.value.code, caught.value.fatal) == ("cli_login", True)
 
 
 def test_gemini_cli_denies_all_tools_and_uses_our_system_prompt(tmp_path):
@@ -173,4 +188,4 @@ def test_gemini_cli_auth_errors_are_fatal(tmp_path):
         "cat > /dev/null\necho '{\"error\":{\"message\":\"Please set an Auth method\",\"code\":41}}' >&2\nexit 41\n"))
     with pytest.raises(LLMError) as caught:
         GeminiCliClient("", executable).complete("sys", MESSAGES, SCHEMA)
-    assert caught.value.fatal
+    assert (caught.value.code, caught.value.fatal) == ("cli_login", True)
