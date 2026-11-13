@@ -16,24 +16,43 @@ def test_terms_match_words_in_english_and_substrings_in_japanese():
     assert not matches("anything", ["", "  "])
 
 
-def test_fill_by_weight_moves_a_short_share_and_widens_the_window():
-    available = {"a": {"new": 2, "old": 5}, "b": {"new": 10, "old": 0}, "c": {"new": 0, "old": 0}}
-    taken = {"a": 0, "b": 0, "c": 0}
-    windows_used = []
-
+def take_from(available, taken, used=None):
     def fill(key, target, window):
-        windows_used.append((key, window))
+        if used is not None:
+            used.append((key, window))
         while taken[key] < target and available[key][window]:
             available[key][window] -= 1
             taken[key] += 1
         return taken[key] >= target
+    return fill
 
-    targets = fill_by_weight({"a": 3, "b": 1, "c": 2, "off": 0}, 12, ["new", "old"], taken.get, fill)
-    assert sum(taken.values()) == 12
-    # c finds nothing and a finds 2 of 6 new ones, so b takes the rest of the new window.
-    assert taken == {"a": 2, "b": 10, "c": 0}
-    assert targets["off"] == 0 and ("off", "new") not in windows_used
-    assert ("a", "old") not in windows_used  # the count was filled before the wider window
+
+def test_fill_by_weight_widens_each_window_before_moving_a_short_share():
+    available = {"a": {"new": 2, "old": 5}, "b": {"new": 10, "old": 0}, "c": {"new": 0, "old": 0}}
+    taken = {"a": 0, "b": 0, "c": 0}
+    used = []
+    targets = fill_by_weight({"a": 3, "b": 1, "c": 2, "off": 0}, 12, ["new", "old"], taken.get,
+                             take_from(available, taken, used))
+    # a fills its 6 from both windows; c finds nothing, so its 4 go to a and b by weight, and the one
+    # a cannot fill goes to b.
+    assert taken == {"a": 7, "b": 5, "c": 0} and sum(taken.values()) == 12
+    assert targets["off"] == 0 and ("off", "new") not in used
+    assert used.index(("a", "old")) < used.index(("b", "new"), 1)
+
+
+def test_fill_by_weight_never_fills_past_the_total():
+    # Both run short in the first window and find plenty in the second.
+    available = {"a": {"new": 1, "old": 100}, "b": {"new": 6, "old": 100}}
+    taken = {"a": 0, "b": 0}
+    fill_by_weight({"a": 1, "b": 1}, 10, ["new", "old"], taken.get, take_from(available, taken), step=1)
+    assert taken == {"a": 5, "b": 5}
+
+
+def test_fill_by_weight_can_keep_each_share_to_its_key():
+    available = {"a": {"w": 1}, "b": {"w": 100}}
+    taken = {"a": 0, "b": 0}
+    fill_by_weight({"a": 1, "b": 1}, 10, ["w"], taken.get, take_from(available, taken), move_short=False)
+    assert taken == {"a": 1, "b": 5}
 
 
 def test_fill_by_weight_uses_the_wider_window_when_the_first_runs_out():

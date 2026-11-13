@@ -11,7 +11,7 @@ from yourfeed.fetch import SafeHttpClient
 from yourfeed.llm import LLMResult
 from yourfeed.main import app
 from yourfeed.pipeline import run as run_module
-from yourfeed.pipeline.run import close_interrupted, publish, run_cycle
+from yourfeed.pipeline.run import close_interrupted, forget_old, publish, run_cycle
 from yourfeed.search.searxng import Result, SearchError
 
 NOW = datetime.now(timezone.utc)
@@ -144,6 +144,11 @@ def test_settings_api_validates_and_guards_requests(client, engine):
     assert client.put("/v1/settings", json={**body, "interval_minutes": 7}, headers=SAME_ORIGIN).status_code == 422
     assert client.put("/v1/settings", json={**body, "items_per_run": 51}, headers=SAME_ORIGIN).status_code == 422
     assert client.put("/v1/settings", json={**body, "items_per_run": 4}, headers=SAME_ORIGIN).json()["items_per_run"] == 4
+    # The display period covers the interval, or the timeline would be empty until the next update.
+    assert client.put("/v1/settings", json={**body, "interval_minutes": 1440, "retention_hours": 12},
+                      headers=SAME_ORIGIN).status_code == 422
+    assert client.put("/v1/settings", json={**body, "interval_minutes": 1440, "retention_hours": 24},
+                      headers=SAME_ORIGIN).status_code == 200
     assert client.put("/v1/settings", json=body, headers={"Origin": "https://evil.example"}).status_code == 403
     assert client.get("/v1/timeline", headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403
     assert client.get("/v1/settings", headers={"Host": "evil.example"}).status_code == 400
@@ -218,7 +223,8 @@ def test_every_update_searches_the_candidates_and_fills_the_count(client, engine
     assert [url for url, _ in rows[:3]] == [f"https://lab.example/q/news/1/{index}" for index in range(3)]
     assert not any("人事" in title for _, title in rows)
 
-    # 政策's old and undated pages wait for a wider window, so 科学 takes its share.
+    # 空's share goes to 科学 and 政策 by weight. 政策's page older than a week is not used, and its
+    # undated page waits until the dated ones are used.
     assert (result["target"], result["posted"]) == (6, 6)
     assert llm.calls == 7
     page = client.get("/v1/timeline").json()
@@ -233,22 +239,23 @@ def test_every_update_searches_the_candidates_and_fills_the_count(client, engine
             JOIN genres g ON g.id = e.genre_id ORDER BY e.added_at DESC
         """)).all()
         run = connection.execute(text("SELECT status, target, posted, found, llm_calls, input_tokens FROM runs")).one()
-    assert sorted(name for name, _ in posted) == ["政策", "科学", "科学", "科学", "科学", "科学"]
-    assert [url for name, url in posted if name == "政策"] == ["https://gov.example/n/news/1/2"]
+    assert sorted(name for name, _ in posted) == ["政策", "政策", "科学", "科学", "科学", "科学"]
+    assert [url for name, url in posted if name == "政策"] == ["https://gov.example/n/news/1/1",
+                                                               "https://gov.example/n/news/1/2"]
     assert run == ("ok", 6, 6, 12, 7, 600)
     detail = client.get(f"/v1/timeline/{page['items'][0]['id']}").json()
     assert detail["source"] == "Example" and detail["original_title"].startswith("記事/")
     assert page["items"][0]["body"] == detail["facts"] + detail["interpretation"]
 
-    # With search down, the update still posts from earlier candidates, the old and undated ones last.
+    # With search down, the update still posts from earlier candidates; the old page is never posted.
     again = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=FakeSearch(down=True))
-    assert (again["found"], again["search_error"], again["posted"]) == (0, "search_unavailable", 6)
+    assert (again["found"], again["search_error"], again["posted"]) == (0, "search_unavailable", 5)
     status = client.get("/v1/settings").json()["last_run"]
     assert (status["found"], status["found_target"], status["search_error"]) == (0, 12, "search_unavailable")
     with engine.connect() as connection:
-        assert connection.execute(text("""
-            SELECT bool_and(posted_at IS NOT NULL) FROM items WHERE genre_id = :id
-        """), {"id": policy["id"]}).scalar_one()
+        assert dict(connection.execute(text("""
+            SELECT url, skip_reason FROM items WHERE genre_id = :id AND posted_at IS NULL
+        """), {"id": policy["id"]}).all()) == {"https://gov.example/n/news/1/0": "too_old"}
 
     third = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=FakeSearch(down=True))
     assert third["posted"] == 0
@@ -447,3 +454,66 @@ def test_results_wait_for_their_turn_and_old_or_unreadable_ones_are_dropped(clie
         urls = connection.execute(text("SELECT url FROM items WHERE run_id = 1 ORDER BY rank")).scalars().all()
     assert urls == ["https://new.example/a", "https://new.example/b", "https://mixed.example/a",
                     "https://new.example/c"]
+
+
+def test_a_page_with_nothing_new_ends_the_query(client, engine):
+    space = create(client, "宇宙", 1)
+    known = [f"https://known.example/{index}" for index in range(3)]
+    with engine.begin() as connection:
+        for url in known:  # found in an earlier update
+            connection.execute(text("INSERT INTO items (genre_id, url, title) VALUES (:genre, :url, 't')"),
+                               {"genre": space["id"], "url": url})
+        genre = dict(connection.execute(text("SELECT * FROM genres")).mappings().one())
+
+    class Known:
+        queries = []
+
+        def search(self, query, *, page=1, categories="general", time_range=None, language="all"):
+            self.queries.append((page, categories))
+            return [Result(f"{url}?p={page}" if page > 1 else url, "t", "") for url in known]
+
+    search = Known()
+    run_module.Collector(engine, search, 1, NOW).collect([genre], 4)
+    # Each window's query is searched once, since its first page brought nothing new.
+    assert search.queries == [(1, "news"), (1, "general"), (1, "science")]
+
+
+def test_old_data_is_forgotten(client, engine):
+    space = create(client, "宇宙", 1)
+    day = timedelta(days=1)
+    rows = {  # url: (found days ago, attempted days ago, skip reason, posted days ago)
+        "candidate-new": (2, None, None, None), "candidate-old": (4, None, None, None),
+        "retry-old": (4, 4, "temporary_error", None),
+        "failed-new": (20, 10, "http_403", None), "failed-old": (20, 15, "http_403", None),
+        "posted-new": (29, 29, None, 29), "posted-old": (31, 31, None, 31),
+        "on-timeline": (40, 40, None, 40),
+    }
+    with engine.begin() as connection:
+        for url, (found, attempted, reason, posted) in rows.items():
+            item_id = connection.execute(text("""
+                INSERT INTO items (genre_id, url, title, found_at, attempted_at, skip_reason, posted_at)
+                VALUES (:genre, :url, 't', :found, :attempted, :reason, :posted) RETURNING id
+            """), {"genre": space["id"], "url": f"https://a.example/{url}", "found": NOW - found * day,
+                   "attempted": attempted and NOW - attempted * day, "reason": reason,
+                   "posted": posted and NOW - posted * day}).scalar_one()
+            if posted:
+                connection.execute(text("""
+                    INSERT INTO summaries (item_id, title, facts, provider, model) VALUES (:id, 't', 'f', 'p', 'm')
+                """), {"id": item_id})
+            if url == "on-timeline":
+                connection.execute(text("""
+                    INSERT INTO timeline_entries (item_id, genre_id, title, facts) VALUES (:id, :genre, 't', 'f')
+                """), {"id": item_id, "genre": space["id"]})
+        for started in (8, 6, 9):
+            connection.execute(text("INSERT INTO runs (started_at, status) VALUES (:at, 'ok')"),
+                               {"at": NOW - started * day})
+    forget_old(engine, NOW)
+    with engine.connect() as connection:
+        left = set(connection.execute(text("SELECT split_part(url, '/', 4) FROM items")).scalars())
+        summaries = set(connection.execute(text("""
+            SELECT split_part(i.url, '/', 4) FROM summaries s JOIN items i ON i.id = s.item_id
+        """)).scalars())
+        runs = connection.execute(text("SELECT count(*) FROM runs")).scalar_one()
+    assert left == {"candidate-new", "failed-new", "posted-new", "on-timeline"}
+    # Posts off the timeline keep only their URL; the newest run stays however old it is.
+    assert summaries == {"on-timeline"} and runs == 2

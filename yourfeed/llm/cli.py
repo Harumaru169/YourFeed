@@ -54,6 +54,23 @@ class Workdir:
             raise LLMError("timeout") from exc
 
 
+LIMIT_WORDS = ("usage limit", "rate limit", "rate_limit", "hit your limit", "limit reached", "quota",
+               "too many requests", "resource_exhausted", "resource exhausted")
+
+
+def limit_reached(text: str) -> bool:
+    """True when the plan's usage limit stopped the call; it works again once the limit resets."""
+    lowered = text.lower()
+    return any(word in lowered for word in LIMIT_WORDS)
+
+
+def cli_failure(text: str, fatal: bool = False) -> LLMError:
+    """The error for a failed CLI call: the usage limit, or a CLI error (fatal when not logged in)."""
+    if limit_reached(text):
+        return LLMError("http_429")
+    return LLMError("cli_error", fatal=fatal or login_problem(text))
+
+
 def login_problem(text: str) -> bool:
     lowered = text.lower()
     return any(word in lowered for word in ("not logged in", "login", "log in", "authenticat", "unauthorized",

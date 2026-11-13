@@ -96,6 +96,20 @@ def test_claude_cli_runs_without_tools_and_reads_structured_output(tmp_path):
     assert json.loads(result.text) == REPLY and result.input_tokens == 102 and result.output_tokens == 9
 
 
+def test_cli_usage_limits_are_reported_as_limits(tmp_path):
+    def claude(reply):
+        return ClaudeCliClient("m", fake_cli(tmp_path, "claude", "cat > /dev/null\necho '" + json.dumps(reply) + "'\n"))
+
+    for reply, code, fatal in (
+            ({"is_error": True, "subtype": "success", "result": "Claude AI usage limit reached · resets 3pm"}, "http_429", False),
+            ({"is_error": True, "api_error_status": 429, "result": "x"}, "http_429", False),
+            ({"is_error": True, "subtype": "success", "result": "Not logged in"}, "cli_error", True),
+            ({"is_error": True, "subtype": "success", "result": "API Error: 500"}, "cli_error", False)):
+        with pytest.raises(LLMError) as caught:
+            claude(reply).complete("sys", MESSAGES, SCHEMA)
+        assert (caught.value.code, caught.value.fatal) == (code, fatal)
+
+
 def test_make_client_needs_a_model_for_openai(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(LLMError) as caught:

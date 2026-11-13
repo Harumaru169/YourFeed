@@ -59,6 +59,13 @@ class SettingsIn(BaseModel):
     llm_provider: Literal["openai", "anthropic", "claude_cli", "codex_cli", "gemini_cli"]
     llm_model: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)] = ""
 
+    @model_validator(mode="after")
+    def _retention(self) -> SettingsIn:
+        # Shorter than the interval, the timeline would be empty until the next update.
+        if self.retention_hours * 60 < self.interval_minutes:
+            raise ValueError("retention_hours must cover the interval")
+        return self
+
 
 class GenreIn(BaseModel):
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from .base import LLMError, LLMResult, transcript
-from .cli import Workdir, find, login_problem
+from .base import LLMResult, transcript
+from .cli import Workdir, cli_failure, find
 
 DISABLED_FEATURES = ("shell_tool", "unified_exec", "plugins", "apps", "hooks", "browser_use",
                      "computer_use", "view_image")
@@ -55,6 +55,5 @@ class CodexCliClient:
             elif event.get("type") in {"turn.failed", "error"}:
                 failure = json.dumps(event, ensure_ascii=False)
         if failure or (completed.returncode != 0 and not text):
-            detail = (failure or "") + completed.stderr[-2000:]
-            raise LLMError("cli_error", fatal=login_problem(detail))
+            raise cli_failure((failure or "") + completed.stderr[-2000:])
         return LLMResult(text, input_tokens, output_tokens)

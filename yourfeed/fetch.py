@@ -188,4 +188,6 @@ class SafeHttpClient:
                     raise TemporaryFetchError("timeout") from exc
                 except httpx.TransportError as exc:
                     raise TemporaryFetchError("connection_error") from exc
+                except httpx.HTTPError as exc:  # a body that cannot be decoded, among others
+                    raise FetchError("unreadable") from exc
         raise FetchError("too_many_redirects")

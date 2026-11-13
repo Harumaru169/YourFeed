@@ -19,14 +19,15 @@ class Window(NamedTuple):
     max_age: timedelta | None = None
 
 
-# SearXNG leaves out the engines that cannot limit by time, which for news is all but one,
-# so news is searched without a time range and old results are dropped instead.
+LATEST_AGE = timedelta(days=7)  # genres of the latest news use pages from this past week only
+# SearXNG leaves out the engines that cannot limit by time, which for news and papers is nearly all,
+# so those are searched without a time range and older results are dropped instead.
 LATEST_WINDOWS: tuple[Window, ...] = (
-    Window("news", None, timedelta(days=30)), Window("general", "week"), Window("general,science", "month"),
-    Window("general,science", "year"), Window("general,science"))
+    Window("news", None, LATEST_AGE), Window("general", "week", LATEST_AGE), Window("science", None, LATEST_AGE))
 ANY_AGE_WINDOWS: tuple[Window, ...] = (Window("general"), Window("science"))
 MAX_PAGES = 3
 TAKE = 2  # results taken from one query before the next query's turn
+SITE_QUERIES = 10  # site searches per update; the pairs of site and term take turns over updates
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,12 @@ class GenreSearch:
         has_focus = any(focus for focus, _ in self.queries.values())
         self.share = (genre.get("discovery_percent", 20) / 100) if has_focus else 1.0
         self.offset = offset
+        # Every site with every term in every locale would leave no searches for the open web,
+        # so each update takes the next SITE_QUERIES of them, the first term on each site first.
+        bases = self._bases()
+        pairs = [(locale, site, own[index]) for index in range(max(map(len, bases.values()), default=0))
+                 for site in self.sites for locale, own in bases.items() if index < len(own)]
+        self.site_queries = rotate(pairs, offset * SITE_QUERIES)[:SITE_QUERIES]
         self.open_taken = 0
         self.discovery_taken = 0
         self.locale_taken = {locale: 0 for locale in self.locales}
@@ -126,14 +133,18 @@ class GenreSearch:
     def _topic_locales(self, topic: str) -> list[str]:
         return [locale for locale in self.locales if in_language(language_of(locale), topic)] or self.locales
 
+    def _bases(self) -> dict[str, list[str]]:
+        """Queries a site search starts from in each locale: the focus queries, or else the discovery ones."""
+        return {locale: focus or discovery for locale, (focus, discovery) in self.queries.items()}
+
     def streams(self, window: Window, locale: str | None = None) -> tuple[list[Stream], list[Stream], list[Stream]]:
         locale = locale or self.locales[0]
         if (window, locale) not in self._streams:
             focus, discovery = self.queries[locale]
-            bases = focus or discovery
-            site = [Stream(f"{base} {s.operator}", site=s, locale=locale) for s in self.sites for base in bases]
+            site = [Stream(f"{base} {s.operator}", site=s, locale=locale)
+                    for own, s, base in self.site_queries if own == locale]
             self._streams[(window, locale)] = (
-                rotate(site, self.offset), rotate([Stream(query, locale=locale) for query in focus], self.offset),
+                site, rotate([Stream(query, locale=locale) for query in focus], self.offset),
                 [Stream(query, discovery=True, locale=locale) for query in discovery])
         return self._streams[(window, locale)]
 

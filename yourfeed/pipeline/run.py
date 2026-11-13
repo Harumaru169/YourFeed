@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from sqlalchemy import text
@@ -15,6 +15,7 @@ from yourfeed import config
 from yourfeed.db import WORKER_LOCK
 from yourfeed.llm import LLMClient, LLMError, make_client
 from yourfeed.search.language import LENGTH_SCALE, languages_of, page_language
+from yourfeed.search.plan import LATEST_AGE
 from yourfeed.search.searxng import Searxng
 from yourfeed.fetch import SafeHttpClient
 
@@ -26,11 +27,22 @@ from .summarize import summarize
 from .topics import make_topics, per_update
 from .translate import missing, translate_terms
 
-# Age limits for posts, tried in order until the count is filled. None means any age.
-LATEST_WINDOWS = (timedelta(days=7), timedelta(days=30), None)
-ANY_AGE_WINDOWS = (None,)
+class PostWindow(NamedTuple):
+    """Pages a post may come from: dated within `max_age` (None: any age), undated ones only if `undated`."""
+    max_age: timedelta | None
+    undated: bool = True
+
+
+# Tried in order until the count is filled: genres of the latest news take dated pages of the past
+# week first, then undated ones; genres of any age take any page.
+LATEST_WINDOWS = (PostWindow(LATEST_AGE, undated=False), PostWindow(LATEST_AGE))
+ANY_AGE_WINDOWS = (PostWindow(None),)
 RETRY_AFTER = timedelta(hours=3)
-KEEP_ITEMS = timedelta(days=90)
+# How long old data is kept. A URL that is forgotten may be found again.
+KEEP_CANDIDATES = timedelta(days=3)  # found but not used yet
+KEEP_FAILED = timedelta(days=14)  # pages that could not be used; the recent ones decide unreadable sites
+KEEP_POSTED = timedelta(days=30)  # posted URLs, so the same page is not posted twice
+KEEP_RUNS = timedelta(days=7)
 MAX_CONSECUTIVE_ERRORS = 3
 CALLS_PER_POST = 8
 
@@ -88,8 +100,9 @@ class _Posting:
                 UPDATE runs SET llm_calls = :calls, input_tokens = :input, output_tokens = :output WHERE id = :id
             """), {"id": self.run_id, "calls": self.calls, "input": self.input_tokens, "output": self.output_tokens})
 
-    def _summarize(self, genre: dict[str, Any], row: dict[str, Any], since: datetime | None) -> str:
-        """'ok', 'later' when the page is older than the window or undated, or 'no'."""
+    def _summarize(self, genre: dict[str, Any], row: dict[str, Any], window: PostWindow) -> str:
+        """'ok', 'later' when the page is undated and the window wants dated ones, or 'no'."""
+        since = self.now - window.max_age if window.max_age else None
         page = self.pages.get(row["id"])
         if page is None:
             page, reason = self.fetcher.read(row["url"])
@@ -108,10 +121,11 @@ class _Posting:
             with self.engine.begin() as connection:
                 connection.execute(text("UPDATE items SET published_at = :at WHERE id = :id"),
                                    {"id": row["id"], "at": page_date})
-            if since and page_date < since:
-                return "later"
-        if since and published_at is None:
-            return "later"  # undated pages wait for the widest window
+        if since and published_at and published_at < since:
+            self._mark_attempted(row["id"], "too_old")
+            return "no"
+        if published_at is None and not window.undated:
+            return "later"  # undated pages wait until the dated ones are used
         # Untranslated summaries are written in the page's language, with lengths scaled to it.
         written = None if genre["translate"] or language == "ja" else language
         scale = LENGTH_SCALE.get(written or "", 1.0)
@@ -147,11 +161,11 @@ class _Posting:
             """), {"id": row["id"], "title": title, "site": site_name})
         return "ok"
 
-    def _queue(self, genre: dict[str, Any], stage: int, window: timedelta | None) -> deque[dict[str, Any]]:
+    def _queue(self, genre: dict[str, Any], stage: int, window: PostWindow) -> deque[dict[str, Any]]:
         key = (genre["id"], stage)
         if key not in self.queues:
             with self.engine.connect() as connection:
-                rows = {row["id"]: row for row in load_candidates(connection, genre["id"], self.now, window,
+                rows = {row["id"]: row for row in load_candidates(connection, genre["id"], self.now, window.max_age,
                                                                   genre["latest"]) if row["id"] not in self.tried}
             self.queues[key] = deque(rows[item_id] for item_id in by_site([(row["id"], row["url"])
                                                                            for row in rows.values()]))
@@ -165,7 +179,6 @@ class _Posting:
         if stage >= len(windows):
             return False
         window = windows[stage]
-        since = self.now - window if window else None
         queue = self._queue(genre, stage, window)
         accepted = self.accepted[genre_id]
         while len(accepted) < target and queue:
@@ -175,10 +188,10 @@ class _Posting:
             if row["has_summary"]:
                 result = "ok"
             elif self.llm is not None and self.calls < self.call_cap:
-                result = self._summarize(genre, row, since)
+                result = self._summarize(genre, row, window)
             else:
                 continue
-            if result != "later":  # an older page is tried again in a wider window
+            if result != "later":  # an undated page is tried again in the next window
                 self.tried.add(row["id"])
             if result == "ok":
                 accepted.append(row["id"])
@@ -276,6 +289,7 @@ def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | None, s
     collector = Collector(engine, searcher, run_id, now)
     posting: _Posting | None = None
     try:
+        forget_old(engine, now)
         error = None
         try:
             client = llm or make_client(settings)
@@ -302,7 +316,6 @@ def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | None, s
                 "found": collector.found[genre["id"]], "found_target": found_targets[genre["id"]],
                 "posted": len(posting.accepted[genre["id"]]), "target": targets[genre["id"]]}
         posted = posting.posted + publish(engine, [], settings["retention_hours"])
-        forget_old_items(engine, now)
     except Exception as exc:
         _finish(engine, run_id, "error", posting.posted if posting else 0, posting, detail, (posting and posting.error) or type(exc).__name__)
         raise
@@ -348,10 +361,23 @@ def publish(engine: Engine, posts: list[tuple[Any, Any]], retention_hours: int) 
     return posted
 
 
-def forget_old_items(engine: Engine, now: datetime) -> None:
-    """Old candidates are dropped; their URLs may be found again after that."""
+def forget_old(engine: Engine, now: datetime) -> None:
+    """Drop data past its keeping time. Posts still on the timeline stay, and so does the last run."""
     with engine.begin() as connection:
         connection.execute(text("""
-            DELETE FROM items i WHERE i.found_at < :cutoff
+            DELETE FROM summaries sm USING items i
+            WHERE sm.item_id = i.id AND i.posted_at IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM timeline_entries e WHERE e.item_id = i.id)
-        """), {"cutoff": now - KEEP_ITEMS})
+        """))
+        connection.execute(text("""
+            DELETE FROM items i
+            WHERE NOT EXISTS (SELECT 1 FROM timeline_entries e WHERE e.item_id = i.id) AND CASE
+              WHEN i.posted_at IS NOT NULL THEN i.posted_at < :posted
+              WHEN i.skip_reason IS NOT NULL AND NOT i.skip_reason = ANY(:retryable)
+                THEN COALESCE(i.attempted_at, i.found_at) < :failed
+              ELSE i.found_at < :candidates END
+        """), {"posted": now - KEEP_POSTED, "failed": now - KEEP_FAILED, "candidates": now - KEEP_CANDIDATES,
+               "retryable": sorted(RETRYABLE)})
+        connection.execute(text("""
+            DELETE FROM runs WHERE started_at < :cutoff AND id < (SELECT max(id) FROM runs)
+        """), {"cutoff": now - KEEP_RUNS})

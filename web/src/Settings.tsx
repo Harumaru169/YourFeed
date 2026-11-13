@@ -18,6 +18,8 @@ const ERRORS: Record<string, string> = {
   http_429: 'AIの利用制限',
   cli_not_found: 'CLIが見つかりません',
   cli_error: 'CLIでエラー',
+  unexpected_response: 'AIの応答を読めません',
+  unknown_provider: '接続先が不明',
   connection_error: 'AIに接続できません',
   timeout: 'AIが応答しません',
   search_unavailable: '検索に接続できません',
@@ -72,9 +74,19 @@ function runText(run: Run | null): string {
   return `${when}　${count}${found}${problem}`
 }
 
-function options(list: [number, string][], current: string, unit: string) {
+function options(list: [number, string][], current: string, unit: string, below = 0) {
   const all = list.some(([value]) => String(value) === current) ? list : [...list, [Number(current), `${current}${unit}`] as [number, string]]
-  return all.map(([value, label]) => <option key={value} value={value}>{label}</option>)
+  return all.map(([value, label]) => <option key={value} value={value} disabled={value < below}>{label}</option>)
+}
+
+/** The display period must cover the interval, or the timeline is empty until the next update. */
+const minRetention = (intervalMinutes: string) => Math.ceil(Number(intervalMinutes) / 60)
+
+function withInterval(form: Form, interval: string): Form {
+  const least = minRetention(interval)
+  if (Number(form.retention_hours) >= least) return { ...form, interval_minutes: interval }
+  const retention = RETENTION.find(([hours]) => hours >= least)?.[0] ?? least
+  return { ...form, interval_minutes: interval, retention_hours: String(retention) }
 }
 
 const blurOnEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -122,7 +134,8 @@ export default function Settings() {
 
   const change = (key: keyof Form, section: Section, now = false) =>
     (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-      const next = { ...form, [key]: event.target.value }
+      const next = key === 'interval_minutes' ? withInterval(form, event.target.value)
+        : { ...form, [key]: event.target.value }
       setForm(next)
       if (now) void commit(next, section)
     }
@@ -209,7 +222,7 @@ export default function Settings() {
       </label>
       <label className="field"><span>表示期間</span>
         <select value={form.retention_hours} onChange={change('retention_hours', 'update', true)}>
-          {options(RETENTION, form.retention_hours, '時間')}
+          {options(RETENTION, form.retention_hours, '時間', minRetention(form.interval_minutes))}
         </select>
       </label>
     </form>

@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from yourfeed.search.plan import MAX_PAGES, GenreSearch, Stream, Window
+from yourfeed.search.plan import MAX_PAGES, TAKE, GenreSearch, Stream, Window
 from yourfeed.search.searxng import Result, SearchError
 
 from .pagetext import RETRYABLE
@@ -69,7 +69,8 @@ class Collector:
 
     def collect(self, genres: list[dict], total: int = CANDIDATES) -> dict[Any, int]:
         """Search until `total` new URLs are stored; returns each genre's target. Each genre first
-        gets its weight's share of the searches, and what is left goes to the genres still short."""
+        searches for its own share with its weight's share of the searches; the searches left then go
+        to the genres still short, and only what no window of a genre can fill goes to the others."""
         for index, genre in enumerate(genres):
             self._plans[genre["id"]] = GenreSearch(genre, offset=self.run_id + index)
             self.found[genre["id"]] = self.used[genre["id"]] = 0
@@ -78,10 +79,10 @@ class Collector:
         stages = range(max((len(plan.windows) for plan in self._plans.values()), default=0))
         count = lambda genre_id: self.found[genre_id]  # noqa: E731
         self.caps = allocate(weights, MAX_SEARCHES)
-        targets = fill_by_weight(weights, total, stages, count, self._fill)
+        targets = fill_by_weight(weights, total, stages, count, self._fill, step=TAKE, move_short=False)
         if not self.stopped and self.searches < MAX_SEARCHES and sum(self.found.values()) < total:
             self.caps = None
-            targets = fill_by_weight(weights, total, stages, count, self._fill)
+            targets = fill_by_weight(weights, total, stages, count, self._fill, step=TAKE)
         return targets
 
     def _can_search(self, genre_id: Any) -> bool:
@@ -142,17 +143,17 @@ class Collector:
         stream.page += 1
         fresh = [result for result in results if result.url not in stream.seen]
         stream.seen.update(result.url for result in results)
-        if not fresh or stream.page > MAX_PAGES:
-            stream.done = True  # no more pages, or the engine repeats the same page
+        with self.engine.connect() as connection:
+            known = set(connection.execute(text("SELECT url FROM items WHERE url = ANY(:urls)"),
+                                           {"urls": [result.url for result in fresh]}).scalars())
         exclude = self._plans[genre_id].excludes.get(stream.locale, [])
         oldest = self.now - window.max_age if window.max_age else None
-        for result in fresh:
-            if stream.site is not None and not stream.site.contains(result.url):
-                continue
-            if exclude and matches(f"{result.title} {result.snippet}", exclude):
-                continue
-            if oldest and result.published_at and result.published_at < oldest:
-                continue
-            if host_of(result.url) in self.skip_hosts:
-                continue
-            stream.pending.append(result)
+        usable = [result for result in fresh if result.url not in known
+                  and (stream.site is None or stream.site.contains(result.url))
+                  and not (exclude and matches(f"{result.title} {result.snippet}", exclude))
+                  and not (oldest and result.published_at and result.published_at < oldest)
+                  and host_of(result.url) not in self.skip_hosts]
+        stream.pending.extend(usable)
+        if not usable or stream.page > MAX_PAGES:
+            # A page with nothing new ends the query: later pages are older or already found as well.
+            stream.done = True

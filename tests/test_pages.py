@@ -80,6 +80,20 @@ def test_broken_pdf_is_skipped():
     assert page is None and reason in {"unreadable", "too_little_text"}
 
 
+def test_a_body_that_cannot_be_decoded_skips_only_that_page():
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        if request.url.path == "/broken":
+            return httpx.Response(200, content=b"not gzip at all",
+                                  headers={"Content-Type": "text/html", "Content-Encoding": "gzip"})
+        return httpx.Response(200, content=ARTICLE.encode(), headers={"Content-Type": "text/html; charset=utf-8"})
+    reader = PageFetcher(SafeHttpClient(httpx.Client(transport=httpx.MockTransport(handler)), resolver=PUBLIC,
+                                        allow_private=False))
+    assert reader.read("https://space.example/broken") == (None, "unreadable")
+    assert reader.read("https://space.example/a")[1] is None
+
+
 def test_private_addresses_are_refused():
     for url in ("http://127.0.0.1/", "http://localhost/", "http://[::1]/", "http://169.254.169.254/latest",
                 "http://10.0.0.1/", "http://printer.local/", "http://[::ffff:127.0.0.1]/"):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from .base import LLMError, LLMResult, transcript
-from .cli import Workdir, find, login_problem
+from .cli import Workdir, cli_failure, find, login_problem
 
 
 def command(model: str, system: str, schema: dict, executable: str = "claude") -> list[str]:
@@ -31,8 +31,9 @@ class ClaudeCliClient:
                            fatal=login_problem(completed.stdout + completed.stderr)) from exc
         if data.get("is_error"):
             status = data.get("api_error_status")
-            raise LLMError(f"cli_{data.get('subtype') or 'error'}",
-                           fatal=status in {401, 403, 404} or login_problem(str(data.get("result"))))
+            if status == 429:
+                raise LLMError("http_429")
+            raise cli_failure(str(data.get("result") or ""), fatal=status in {401, 403, 404})
         usage = data.get("usage") or {}
         input_tokens = sum(int(usage.get(key) or 0) for key in
                            ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))

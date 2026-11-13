@@ -47,29 +47,28 @@ def allocate(weights: Mapping[K, int], size: int) -> dict[K, int]:
 
 def fill_by_weight(weights: Mapping[K, int], total: int, windows: Sequence[W],
                    count: Callable[[K], int], fill: Callable[[K, int, W], bool],
-                   step: int | None = None) -> dict[K, int]:
-    """Split `total` by weight, widening the window until it is reached; unfilled shares move to
-    the other keys. `fill` returns False when its window has nothing left. Returns the targets.
+                   step: int | None = None, move_short: bool = True) -> dict[K, int]:
+    """Split `total` by weight. Each key widens its window until its share is filled; with `move_short`,
+    what is still missing then goes to the keys that have more. `fill` returns False when its window
+    has nothing left. Never fills past `total`. Returns the targets.
     With `step`, the key furthest from its target goes next and adds at most `step` items."""
     keys = [key for key, weight in weights.items() if weight > 0]
     targets = {key: 0 for key in weights} | allocate({key: weights[key] for key in keys}, total)
-    for window in windows:
-        exhausted: set[K] = set()
-        while True:
-            while waiting := [key for key in keys if key not in exhausted and count(key) < targets[key]]:
-                key = waiting[0] if step is None else min(waiting, key=lambda other: count(other) / targets[other])
-                goal = targets[key] if step is None else min(targets[key], count(key) + step)
-                if not fill(key, goal, window):
-                    exhausted.add(key)
-            short = total - sum(count(key) for key in keys)
-            open_keys = [key for key in keys if key not in exhausted]
-            if short <= 0 or not open_keys:
-                break
-            for key, extra in allocate({key: weights[key] for key in open_keys}, short).items():
-                targets[key] += extra
-        if sum(count(key) for key in keys) >= total:
-            break
-    return targets
+    stage = {key: 0 for key in keys}
+    filled = lambda: sum(count(key) for key in keys)  # noqa: E731
+    while True:
+        while filled() < total and (waiting := [key for key in keys
+                                                if stage[key] < len(windows) and count(key) < targets[key]]):
+            key = waiting[0] if step is None else min(waiting, key=lambda other: count(other) / targets[other])
+            goal = targets[key] if step is None else min(targets[key], count(key) + step)
+            if not fill(key, min(goal, count(key) + total - filled()), windows[stage[key]]):
+                stage[key] += 1
+        short = total - filled()
+        open_keys = [key for key in keys if stage[key] < len(windows)]
+        if not move_short or short <= 0 or not open_keys:
+            return targets
+        for key, extra in allocate({key: weights[key] for key in open_keys}, short).items():
+            targets[key] += extra
 
 
 def by_site(items: Sequence[tuple[Any, str]]) -> list[Any]:

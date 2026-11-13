@@ -3,7 +3,7 @@ from datetime import timedelta
 import httpx
 import pytest
 
-from yourfeed.search.plan import TAKE, GenreSearch, Site, Window, queries, terms_for
+from yourfeed.search.plan import SITE_QUERIES, TAKE, GenreSearch, Site, Window, queries, terms_for
 from yourfeed.search.searxng import Result, SearchError, Searxng, canonical_url, parse_results
 
 
@@ -133,9 +133,22 @@ def test_a_stream_never_gets_more_than_the_remaining_need():
     assert stream.discovery and limit == 1
 
 
-def test_latest_news_is_searched_without_a_time_range():
-    window = GenreSearch({"name": "AI"}).windows[0]
-    assert (window.categories, window.time_range, window.max_age) == ("news", None, timedelta(days=30))
+def test_latest_genres_search_the_past_week_only():
+    week = timedelta(days=7)
+    assert GenreSearch({"name": "AI"}).windows == (Window("news", None, week), Window("general", "week", week),
+                                                   Window("science", None, week))
+
+
+def test_site_searches_are_limited_and_take_turns():
+    genre = {"name": "AI", "locales": ["ja-JP", "en"], "sites": [f"https://s{n}.example" for n in range(4)],
+             "focus_terms": ["a", "b", "c"], "exclude_terms": [], "discovery_percent": 20}
+    first, second = GenreSearch(genre, offset=0), GenreSearch(genre, offset=1)
+    queries = lambda plan: [query for _, _, query in plan.site_queries]  # noqa: E731
+    assert len(first.site_queries) == SITE_QUERIES
+    # The first term on every site in every locale comes first, then the next term.
+    assert queries(first)[:8] == ["AI a"] * 8 and queries(first)[8:] == ["AI b"] * 2
+    assert queries(second)[:6] == ["AI b"] * 6 and set(queries(second)[6:]) == {"AI c"}
+    assert [stream.query for stream in first.streams(first.windows[0], "en")[0]][:1] == ["AI a site:s0.example"]
 
 
 def test_genres_of_any_age_search_their_topics_without_a_time_limit():

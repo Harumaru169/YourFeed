@@ -6,7 +6,7 @@ import json
 import os
 
 from .base import LLMError, LLMResult, transcript
-from .cli import Workdir, find, login_problem
+from .cli import Workdir, cli_failure, find, login_problem
 
 # Admin-tier policy: the highest tier, so user or workspace settings cannot allow a tool.
 DENY_ALL = '[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\n'
@@ -50,9 +50,8 @@ class GeminiCliClient:
             raise LLMError("unexpected_response", fatal=login_problem(completed.stdout + completed.stderr))
         if data.get("error"):
             error = data["error"]
-            fatal = completed.returncode == AUTH_ERROR_CODE or error.get("code") == AUTH_ERROR_CODE \
-                or login_problem(json.dumps(error, ensure_ascii=False))
-            raise LLMError("cli_error", fatal=fatal)
+            raise cli_failure(json.dumps(error, ensure_ascii=False),
+                              fatal=completed.returncode == AUTH_ERROR_CODE or error.get("code") == AUTH_ERROR_CODE)
         input_tokens = output_tokens = 0
         for model_stats in ((data.get("stats") or {}).get("models") or {}).values():
             tokens = model_stats.get("tokens") or {}
