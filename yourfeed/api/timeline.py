@@ -65,6 +65,7 @@ def timeline(cursor: str | None = None, engine: Engine = Depends(get_engine)) ->
                                   params).mappings().all()
         updating = connection.execute(text(UPDATING_QUERY), {"key": WORKER_LOCK}).scalar_one()
     items = [{"id": str(row["id"]), "title": row["title"], "body": row["facts"] + row["interpretation"],
+              "genre": row["genre"],
               "added_at": row["added_at"].isoformat()} for row in rows]
     next_cursor = (f"{rows[-1]['added_at'].isoformat()}|{rows[-1]['id']}"
                    if len(rows) == PAGE_SIZE else None)

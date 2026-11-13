@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { api } from './api'
 import type { Card, Detail, Run } from './api'
 import { Link, navigate } from './router'
-import { Button, Text } from '@primer/react'
+import { Button, Label, Text } from '@primer/react'
 import { Card as PrimerCard } from '@primer/react/experimental'
 
 const UPDATING_MS = 5 * 1000
@@ -172,6 +172,7 @@ export default function Timeline({ path }: { path: string }) {
       {cards.map((card) => <PrimerCard className="feed-card" key={card.id}>
         <PrimerCard.Heading as="h2"><button className="card-open" onClick={(event) => open(card.id, event.currentTarget)}>{card.title}</button></PrimerCard.Heading>
         <PrimerCard.Description>{card.body}</PrimerCard.Description>
+        <PrimerCard.Metadata className="card-genre"><Label>{card.genre}</Label></PrimerCard.Metadata>
       </PrimerCard>)}
     </section>
     {error && <div className="notice" role="alert">

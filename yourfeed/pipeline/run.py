@@ -394,20 +394,24 @@ def _finish(engine: Engine, run_id: int, status: str, posted: int, posting: _Pos
 def publish(engine: Engine, posts: list[tuple[Any, Any]], retention_hours: int) -> int:
     """Insert posts so the first one is newest, then drop posts past the retention time."""
     now = datetime.now(timezone.utc)
-    posted = 0
+    titles: list[str] = []
     with engine.begin() as connection:
         for index, (genre_id, item_id) in enumerate(posts):
-            posted += connection.execute(text("""
+            title = connection.execute(text("""
                 INSERT INTO timeline_entries (item_id, genre_id, title, facts, interpretation, added_at)
                 SELECT item_id, :genre_id, title, facts, interpretation, :added_at
                 FROM summaries WHERE item_id = :item_id
-                ON CONFLICT (item_id) DO NOTHING
+                ON CONFLICT (item_id) DO NOTHING RETURNING title
             """), {"item_id": item_id, "genre_id": genre_id,
-                   "added_at": now - timedelta(milliseconds=index)}).rowcount
+                   "added_at": now - timedelta(milliseconds=index)}).scalar_one_or_none()
+            if title is not None:
+                titles.append(title)
             connection.execute(text("UPDATE items SET posted_at = now() WHERE id = :id"), {"id": item_id})
         connection.execute(text("DELETE FROM timeline_entries WHERE added_at < :cutoff"),
                            {"cutoff": now - timedelta(hours=retention_hours)})
-    return posted
+    for title in titles:
+        print(json.dumps({"event": "card_published", "title": title[:15]}, ensure_ascii=False), flush=True)
+    return len(titles)
 
 
 def forget_old(engine: Engine, now: datetime) -> None:

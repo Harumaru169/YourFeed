@@ -254,6 +254,7 @@ def test_every_update_searches_the_candidates_and_fills_the_count(client, engine
     detail = client.get(f"/v1/timeline/{page['items'][0]['id']}").json()
     assert detail["source"] == "Example" and detail["original_title"].startswith("記事/")
     assert page["items"][0]["body"] == detail["facts"] + detail["interpretation"]
+    assert page["items"][0]["genre"] == detail["genre"]
 
     # With search down, the update still posts from earlier candidates; the old page is never posted.
     again = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=FakeSearch(down=True))

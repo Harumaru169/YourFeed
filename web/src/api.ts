@@ -2,6 +2,7 @@ export interface Card {
   id: string
   title: string
   body: string
+  genre: string
   added_at: string
 }
 
