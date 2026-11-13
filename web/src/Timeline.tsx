@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { api } from './api'
-import type { Card, Detail } from './api'
+import type { Card, Detail, Run } from './api'
 import { Link, navigate } from './router'
+import { Button, Text } from '@primer/react'
+import { Card as PrimerCard } from '@primer/react/experimental'
 
 const UPDATING_MS = 5 * 1000
 const IDLE_MS = 60 * 1000
 
 const dateFormat = new Intl.DateTimeFormat('ja-JP', { year: 'numeric', month: 'numeric', day: 'numeric' })
+const updateFormat = new Intl.DateTimeFormat('ja-JP', {
+  year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+})
 
 function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: () => void; onClosed: () => void }) {
   const ref = useRef<HTMLDialogElement>(null)
@@ -58,6 +63,7 @@ export default function Timeline({ path }: { path: string }) {
   const [busy, setBusy] = useState(false)
   const [done, setDone] = useState(false)
   const [error, setError] = useState(false)
+  const [lastRun, setLastRun] = useState<Run | null>()
   const cursor = useRef<string | null>(null)
   const seen = useRef(new Set<string>())
   const inFlight = useRef(false)
@@ -73,6 +79,9 @@ export default function Timeline({ path }: { path: string }) {
     inFlight.current = true
     setBusy(true)
     setError(false)
+    if (fromTop || !loaded.current) {
+      void api.settings().then((settings) => setLastRun(settings.last_run)).catch(() => {})
+    }
     try {
       const page = await api.timeline(fromTop ? undefined : cursor.current ?? undefined)
       const fresh = page.items.filter((item) => !seen.current.has(item.id))
@@ -152,18 +161,22 @@ export default function Timeline({ path }: { path: string }) {
   }
 
   return <main className="page" aria-busy={busy}>
-    <nav className="top"><Link to="/settings">設定</Link></nav>
+    <nav className="top feed-top">
+      <Text size="small" className="last-update">
+        {lastRun === undefined ? '' : lastRun === null ? '未更新' : lastRun.status === 'running' ? '更新中'
+          : `最終更新：${updateFormat.format(new Date(lastRun.finished_at ?? lastRun.started_at))}`}
+      </Text>
+      <Link to="/settings" button>設定</Link>
+    </nav>
     <section className="cards">
-      {cards.map((card) => <article className="card" key={card.id}>
-        <button className="card-open" onClick={(event) => open(card.id, event.currentTarget)}>
-          <span className="card-title">{card.title}</span>
-          <span className="card-body">{card.body}</span>
-        </button>
-      </article>)}
+      {cards.map((card) => <PrimerCard className="feed-card" key={card.id}>
+        <PrimerCard.Heading as="h2"><button className="card-open" onClick={(event) => open(card.id, event.currentTarget)}>{card.title}</button></PrimerCard.Heading>
+        <PrimerCard.Description>{card.body}</PrimerCard.Description>
+      </PrimerCard>)}
     </section>
     {error && <div className="notice" role="alert">
       <span>接続できません。</span>
-      <button onClick={() => void load(false)}>再試行</button>
+      <Button onClick={() => void load(false)}>再試行</Button>
     </div>}
     <div ref={sentinel} className="end" />
     <DetailDialog id={detailId} onClose={close} onClosed={restore} />

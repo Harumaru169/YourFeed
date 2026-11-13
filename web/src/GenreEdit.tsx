@@ -1,3 +1,4 @@
+import { Button, Checkbox, Radio, TextInput, Textarea } from '@primer/react'
 import { useEffect, useState } from 'react'
 import { api, ApiError } from './api'
 import type { Genre } from './api'
@@ -69,7 +70,7 @@ export default function GenreEdit({ id }: { id: string }) {
     api.genre(id).then((genre) => setForm(toForm(genre))).catch(() => setMissing(true))
   }, [id])
 
-  const back = <nav className="top top-start"><Link to="/settings">戻る</Link></nav>
+  const back = <nav className="top top-start"><Link to="/settings" button>戻る</Link></nav>
   if (missing) return <main className="page settings">{back}<p>見つかりません。</p></main>
   if (!form) return <main className="page settings" aria-busy="true">{back}</main>
 
@@ -127,12 +128,12 @@ export default function GenreEdit({ id }: { id: string }) {
     <form onSubmit={save}>
       <div className="group">
         <label className="field"><span>名前</span>
-          <input className="text" required maxLength={40} value={form.name} onChange={set('name')} />
+          <TextInput className="text" required maxLength={40} value={form.name} onChange={set('name')} />
         </label>
         <div className="field" role="radiogroup" aria-labelledby="latest-label"><span id="latest-label">新しさ</span>
           <span className="segments">
             {FRESHNESS.map(([label, value]) => <label key={label} className={form.latest === value ? 'selected' : ''}>
-              <input type="radio" name="latest" checked={form.latest === value}
+              <Radio value={String(value)} name="latest" checked={form.latest === value}
                 onChange={() => setForm({ ...form, latest: value })} />
               {label}
             </label>)}
@@ -142,7 +143,7 @@ export default function GenreEdit({ id }: { id: string }) {
           <span id="locales-label">国と地域・言語</span>
           <span className="checks">
             {LOCALES.map(([value, label]) => <label key={value}>
-              <input type="checkbox" checked={form.locales.includes(value)}
+              <Checkbox checked={form.locales.includes(value)}
                 onChange={() => setForm({ ...form, locales: toggleLocale(form.locales, value) })} />
               {label}
             </label>)}
@@ -151,7 +152,7 @@ export default function GenreEdit({ id }: { id: string }) {
         <div className="field" role="radiogroup" aria-labelledby="translate-label"><span id="translate-label">翻訳</span>
           <span className="segments">
             {TRANSLATE.map(([label, value]) => <label key={label} className={form.translate === value ? 'selected' : ''}>
-              <input type="radio" name="translate" checked={form.translate === value}
+              <Radio value={String(value)} name="translate" checked={form.translate === value}
                 onChange={() => setForm({ ...form, translate: value })} />
               {label}
             </label>)}
@@ -161,7 +162,7 @@ export default function GenreEdit({ id }: { id: string }) {
 
       <div className="group">
         <label className="field field-top"><span>サイト</span>
-          <textarea rows={Math.max(2, lines(form.sites).length + 1)} spellCheck={false} wrap="off"
+          <Textarea rows={Math.max(2, lines(form.sites).length + 1)} spellCheck={false} wrap="off"
             value={form.sites} onChange={set('sites')} aria-invalid={invalid.length > 0} />
         </label>
         {invalid.length > 0 && <ul className="field-note" role="alert">
@@ -171,30 +172,30 @@ export default function GenreEdit({ id }: { id: string }) {
 
       <div className="group">
         <label className="field field-top"><span>注目する語</span>
-          <textarea rows={3} value={form.focus_terms} onChange={set('focus_terms')} />
+          <Textarea rows={3} value={form.focus_terms} onChange={set('focus_terms')} />
         </label>
         {hasTerms && <label className="field"><span>注目語以外</span>
-          <span className="with-unit"><input type="number" min={0} max={100} required value={form.discovery_percent}
+          <span className="with-unit"><TextInput type="number" min={0} max={100} required value={form.discovery_percent}
             onChange={set('discovery_percent')} />%</span>
         </label>}
         <label className="field field-top"><span>除外する語</span>
-          <textarea rows={2} value={form.exclude_terms} onChange={set('exclude_terms')} />
+          <Textarea rows={2} value={form.exclude_terms} onChange={set('exclude_terms')} />
         </label>
       </div>
 
       <div className="group">
         <div className="field"><span>文字数</span>
           <span className="with-unit">
-            <input type="number" min={40} max={800} required aria-label="最小の文字数" value={form.min_chars}
+            <TextInput type="number" min={40} max={800} required aria-label="最小の文字数" value={form.min_chars}
               onChange={set('min_chars')} />〜
-            <input type="number" min={40} max={800} required aria-label="最大の文字数" value={form.max_chars}
+            <TextInput type="number" min={40} max={800} required aria-label="最大の文字数" value={form.max_chars}
               onChange={set('max_chars')} />字
           </span>
         </div>
         <div className="field" role="radiogroup" aria-labelledby="stance-label"><span id="stance-label">事実と解釈</span>
           <span className="segments">
             {STANCES.map((label, index) => <label key={label} className={form.stance === index ? 'selected' : ''}>
-              <input type="radio" name="stance" checked={form.stance === index}
+              <Radio value={String(index)} name="stance" checked={form.stance === index}
                 onChange={() => setForm({ ...form, stance: index })} />
               {label}
             </label>)}
@@ -203,9 +204,9 @@ export default function GenreEdit({ id }: { id: string }) {
       </div>
 
       <div className="actions">
-        <button type="submit" className="primary" disabled={saving}>{saving ? '保存中' : '保存'}</button>
+        <Button type="submit" variant="primary" disabled={saving}>{saving ? '保存中' : '保存'}</Button>
         <span className="message" role="status">{message}</span>
-        {!isNew && <button type="button" className="danger" onClick={() => void remove()}>削除</button>}
+        {!isNew && <Button type="button" variant="danger" className="danger" onClick={() => void remove()}>削除</Button>}
       </div>
     </form>
   </main>

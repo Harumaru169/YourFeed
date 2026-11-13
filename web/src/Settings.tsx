@@ -1,3 +1,5 @@
+import { Button, Select, TextInput } from '@primer/react'
+import { useAppearance } from './Theme'
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import type { Backend, GenreRow, Provider, Run, Settings as SettingsData, SettingsValues, Switch } from './api'
@@ -112,6 +114,7 @@ const blurOnEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
 }
 
 export default function Settings() {
+  const { theme, setTheme } = useAppearance()
   const [data, setData] = useState<SettingsData | null>(null)
   const [form, setForm] = useState<Form | null>(null)
   const [weights, setWeights] = useState<Record<string, string>>({})
@@ -227,7 +230,16 @@ export default function Settings() {
   </div>
 
   return <main className="page settings">
-    <nav className="top top-start"><Link to="/">戻る</Link></nav>
+    <nav className="top top-start"><Link to="/" button>戻る</Link></nav>
+
+    <section className="group">
+      <div className="group-head"><h2>外観</h2></div>
+      <label className="field"><span>テーマ</span>
+        <Select value={theme} onChange={(event) => setTheme(event.target.value as 'auto' | 'light' | 'dark')}>
+          <option value="auto">自動</option><option value="light">ライト</option><option value="dark">ダーク</option>
+        </Select>
+      </label>
+    </section>
 
     <section className="group">
       {heading('ジャンル', 'genres')}
@@ -236,7 +248,7 @@ export default function Settings() {
         <ul className="genres">
           {data.genres.map((genre) => <li key={genre.id} className={counts[genre.id] ? '' : 'off'}>
             <Link to={`/settings/genres/${genre.id}`} className="genre-name">{genre.name}</Link>
-            <input type="number" min={0} max={100} required aria-label={`${genre.name}の比率`}
+            <TextInput type="number" min={0} max={100} required aria-label={`${genre.name}の比率`}
               value={weights[genre.id] ?? ''} onKeyDown={blurOnEnter}
               onChange={(event) => setWeights({ ...weights, [genre.id]: event.target.value })}
               onBlur={() => void saveWeight(genre)} />
@@ -250,18 +262,18 @@ export default function Settings() {
     <form className="group" data-section="update" onSubmit={(event) => event.preventDefault()}>
       {heading('更新', 'update')}
       <label className="field"><span>更新間隔</span>
-        <select value={form.interval_minutes} onChange={change('interval_minutes', 'update', true)}>
+        <Select value={form.interval_minutes} onChange={change('interval_minutes', 'update', true)}>
           {options(INTERVALS, form.interval_minutes, '分')}
-        </select>
+        </Select>
       </label>
       <label className="field"><span>1回の件数</span>
-        <span className="with-unit"><input type="number" min={1} max={50} required value={form.items_per_run}
+        <span className="with-unit"><TextInput type="number" min={1} max={50} required value={form.items_per_run}
           onChange={change('items_per_run', 'update')} onBlur={blur('update')} onKeyDown={blurOnEnter} />件</span>
       </label>
       <label className="field"><span>表示期間</span>
-        <select value={form.retention_hours} onChange={change('retention_hours', 'update', true)}>
+        <Select value={form.retention_hours} onChange={change('retention_hours', 'update', true)}>
           {options(RETENTION, form.retention_hours, '時間', minRetention(form.interval_minutes))}
-        </select>
+        </Select>
       </label>
     </form>
 
@@ -270,25 +282,25 @@ export default function Settings() {
       <ol className="backends">
         {form.backends.map((backend, index) => <li key={index}>
           <label className="field"><span>{index === 0 ? '接続先' : `切り替え先${index}`}</span>
-            <select value={backend.provider}
+            <Select value={backend.provider}
               onChange={(event) => editBackend(index, { provider: event.target.value as Provider, model: '' }, true)}>
               {PROVIDERS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-            </select>
+            </Select>
           </label>
           <label className="field"><span>モデル</span>
-            <input className="text" spellCheck={false} value={backend.model}
+            <TextInput className="text" spellCheck={false} value={backend.model}
               placeholder={data.default_models[backend.provider] ?? ''}
               onChange={(event) => editBackend(index, { model: event.target.value }, false)}
               onBlur={blur('ai')} onKeyDown={blurOnEnter} />
           </label>
           {index > 0 && <div className="backend-actions">
-            <button type="button" onClick={() => raiseBackend(index)}>上へ</button>
-            <button type="button" onClick={() => removeBackend(index)}>削除</button>
+            <Button type="button" onClick={() => raiseBackend(index)}>上へ</Button>
+            <Button type="button" onClick={() => removeBackend(index)}>削除</Button>
           </div>}
         </li>)}
       </ol>
-      {form.backends.length < MAX_BACKENDS && <button type="button" className="button" onClick={addBackend}>
-        切り替え先を追加</button>}
+      {form.backends.length < MAX_BACKENDS && <Button type="button" className="button" onClick={addBackend}>
+        切り替え先を追加</Button>}
       <p className="note">上の接続先が利用の上限やログイン切れなどで使えなくなると、その更新の間は次の切り替え先を使います。</p>
       {uses('openai') && <div className="field"><span>URL</span>
         <span className="value url">{data.openai_base_url}</span>
@@ -301,7 +313,7 @@ export default function Settings() {
 
     <section className="group status">
       <span>{waiting ? '更新中' : runText(data.last_run)}</span>
-      <button type="button" onClick={() => void refresh()} disabled={waiting}>今すぐ更新</button>
+      <Button type="button" onClick={() => void refresh()} disabled={waiting}>今すぐ更新</Button>
     </section>
   </main>
 }

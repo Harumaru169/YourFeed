@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { LinkButton } from '@primer/react'
 
 const EVENT = 'yourfeed:navigate'
 
@@ -22,10 +23,14 @@ export function usePath() {
   return path
 }
 
-export function Link({ to, className, children }: { to: string; className?: string; children: React.ReactNode }) {
-  return <a href={to} className={className} onClick={(event) => {
+export function Link({ to, className, children, button = false }: {
+  to: string; className?: string; children: React.ReactNode; button?: boolean
+}) {
+  const onClick = (event: React.MouseEvent<HTMLElement>) => {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return
     event.preventDefault()
     navigate(to)
-  }}>{children}</a>
+  }
+  if (button) return <LinkButton href={to} className={className} onClick={onClick}>{children}</LinkButton>
+  return <a href={to} className={className} onClick={onClick}>{children}</a>
 }
