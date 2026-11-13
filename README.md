@@ -19,7 +19,7 @@
 - AIの接続先のどれか一つ
   - OpenAI互換API（OpenAI、Gemini、OpenRouter、Ollama など）
   - Claude API
-  - Claude・ChatGPT・Google のサブスクリプション（Claude Code・Codex・Gemini CLI を使う）
+  - Claude・ChatGPT のサブスクリプション、Gemini Code Assist（Claude Code・Codex・Gemini CLI を使う）
 
 ## 起動
 
@@ -117,7 +117,7 @@ http://localhost:8000 を開き、右上の「設定」で次の順に決めま�
 | モデルが見つかりません | モデル名を確かめる |
 | AIの利用制限 | APIやサブスクリプションの上限に達した。時間をおくと戻る。何度も出るときは、更新間隔を長くするか1回の件数を減らす |
 | CLIが見つかりません | `.env` の `YOURFEED_CLIS` にそのCLIを書き、`docker compose up -d --build` で作り直す（「サブスクリプションを使う」）。Dockerを使わないときはCLIを入れる |
-| CLIにログインしていません | 「サブスクリプションを使う」の手順でログインする。Claude Code のトークンは1年で切れるので作り直す |
+| CLIにログインしていません | 「サブスクリプションを使う」の手順でログインし直す |
 | AIに接続できません、AIが応答しません | `OPENAI_BASE_URL` と、AIのサーバーが動いているかを確かめる |
 | 検索に接続できません | `docker compose ps` で searxng が動いているかを確かめる |
 | 検索がJSONに未対応 | 自分で用意した SearXNG なら、`search.formats` に `json` を加える |
@@ -134,9 +134,11 @@ http://localhost:8000 を開き、右上の「設定」で次の順に決めま�
 | OpenRouter | OpenAI互換API | `OPENAI_BASE_URL=https://openrouter.ai/api/v1`、`OPENAI_API_KEY` |
 | Ollama | OpenAI互換API | `OPENAI_BASE_URL=http://host.docker.internal:11434/v1`（Dockerなしでは `http://localhost:11434/v1`） |
 | Claude | Claude API | `ANTHROPIC_API_KEY` |
-| Claude のサブスクリプション | Claude Code | `YOURFEED_CLIS=claude`、`CLAUDE_CODE_OAUTH_TOKEN` |
+| Claude のサブスクリプション | Claude Code | `YOURFEED_CLIS=claude` |
 | ChatGPT のサブスクリプション | Codex | `YOURFEED_CLIS=codex` |
-| Google アカウント | Gemini CLI | `YOURFEED_CLIS=gemini` |
+| Gemini Code Assist（Standard・Enterprise） | Gemini CLI | `YOURFEED_CLIS=gemini` |
+
+個人の Google アカウント（無料、Google AI Pro・Ultra）では、2026年6月18日から Gemini CLI を使えません。Gemini を使うときは、[Google AI Studio](https://aistudio.google.com/) のAPIキーで「OpenAI互換API」を選びます。
 
 ### サブスクリプションを使う
 
@@ -148,15 +150,17 @@ Claude Code・Codex・Gemini CLI を Docker のイメージに入れて使いま
 
 | CLI | ログイン |
 |---|---|
-| Claude Code | `docker compose run --rm -it worker claude setup-token` で出てきたトークン（1年有効）を `.env` の `CLAUDE_CODE_OAUTH_TOKEN` に書き、`docker compose up -d` で反映する |
+| Claude Code | `docker compose run --rm -it worker claude auth login` |
 | Codex | `docker compose run --rm -it worker codex login --device-auth` |
 | Gemini CLI | `docker compose run --rm -it -e NO_BROWSER=true worker gemini` で「Login with Google」を選ぶ。終わったら `/quit` で閉じる |
 
-Codex と Gemini CLI のログインは `cli-home` ボリュームに残ります。`docker compose down -v` を実行すると消えます。
+ログインは各CLIが自分で `cli-home` ボリュームに保存し、YourFeed はログイン情報を読みません。`docker compose down -v` を実行すると消えます。
 
 Docker を使わないときは、CLIを入れてログインした環境で動かします（「Dockerを使わずに動かす」）。この場合に対応するのは Linux と macOS で、Windows では WSL2 の中で動かします。
 
 どのCLIもツールを無効にして呼び出し、AIには記事の本文だけを渡します。
+
+サブスクリプションの使い方は、各社の規約に従ってください。YourFeed は、各社の公式CLIを改変せずに、ログインした本人のアカウントで呼び出します。ただし、利用上限は個人が普通に使うことを前提にしています。また、Anthropic は製品から Claude を使うときは API キーを勧めています（[Claude Code の規約](https://code.claude.com/docs/en/legal-and-compliance)）。定期的に多くの記事を要約するなら、APIキーを使うのが確実です。
 
 AIは1件につき1〜2回呼びます（50件の更新で90回ほど）。サブスクリプションには利用の上限があるので、更新間隔が短いと上限に達して投稿が止まり、設定画面に「AIの利用制限」と出ます。50件なら更新間隔を3時間以上にするのが目安です。
 
@@ -175,7 +179,6 @@ AIは1件につき1〜2回呼びます（50件の更新で90回ほど）。サ�
 | `SEARXNG_URL` | Dockerなしで使う SearXNG のURL（既定 `http://127.0.0.1:8888`） |
 | `YOURFEED_ALLOW_PRIVATE_URLS` | `1` でLAN内やlocalhostのページも読む |
 | `YOURFEED_CLIS` | Dockerのイメージに入れるCLI（`claude`、`codex`、`gemini` をカンマ区切り） |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Dockerで Claude Code を使うときのトークン（`claude setup-token` で作る） |
 
 ## 更新・停止
 

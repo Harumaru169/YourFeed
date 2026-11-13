@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 
 from .base import LLMError, LLMResult, transcript
 from .cli import Workdir, cli_failure, find, unreadable_reply
-
-# The long-lived token from `claude setup-token`, for a container that cannot log in with a browser.
-# ANTHROPIC_API_KEY is never passed: with it, Claude Code would bill the API instead of the plan.
-PASSED_ENV = ("CLAUDE_CODE_OAUTH_TOKEN",)
 
 
 def command(model: str, system: str, schema: dict, executable: str = "claude") -> list[str]:
@@ -27,9 +22,10 @@ class ClaudeCliClient:
         self.executable = executable or find("claude")
 
     def complete(self, system: str, messages: list[dict[str, str]], schema: dict) -> LLMResult:
-        env = {name: os.environ[name] for name in PASSED_ENV if os.environ.get(name)}
+        # The CLI uses its own login. No key or token is passed: with ANTHROPIC_API_KEY,
+        # Claude Code would bill the API instead of the plan.
         with Workdir(self.executable) as workdir:
-            completed = workdir.run(command(self.model, system, schema, self.executable), transcript(messages), env)
+            completed = workdir.run(command(self.model, system, schema, self.executable), transcript(messages))
         try:
             data = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:

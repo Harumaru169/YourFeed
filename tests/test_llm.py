@@ -110,7 +110,7 @@ def test_cli_usage_limits_are_reported_as_limits(tmp_path):
         assert (caught.value.code, caught.value.fatal) == (code, fatal)
 
 
-def test_claude_cli_gets_only_the_subscription_token(tmp_path, monkeypatch):
+def test_claude_cli_uses_its_own_login(tmp_path, monkeypatch):
     seen = tmp_path / "env.txt"
     executable = fake_cli(tmp_path, "claude", (
         f'cat > /dev/null\necho "token=$CLAUDE_CODE_OAUTH_TOKEN key=$ANTHROPIC_API_KEY" > {seen}\n'
@@ -118,7 +118,7 @@ def test_claude_cli_gets_only_the_subscription_token(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-test")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")  # would bill the API instead of the plan
     ClaudeCliClient("m", executable).complete("sys", MESSAGES, SCHEMA)
-    assert seen.read_text().strip() == "token=sk-ant-oat-test key="
+    assert seen.read_text().strip() == "token= key="
     with pytest.raises(LLMError) as caught:  # a login prompt instead of JSON
         ClaudeCliClient("m", fake_cli(tmp_path, "claude", "cat > /dev/null\necho 'Invalid API key · Please run /login'\n")
                         ).complete("sys", MESSAGES, SCHEMA)

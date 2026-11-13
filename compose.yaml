@@ -12,7 +12,6 @@ x-app: &app
     OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-    CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
     SEARXNG_URL: http://searxng:8080
   extra_hosts:
     - "host.docker.internal:host-gateway"
