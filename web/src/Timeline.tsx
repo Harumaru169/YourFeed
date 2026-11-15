@@ -15,30 +15,34 @@ const updateFormat = new Intl.DateTimeFormat('ja-JP', {
 
 function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: () => void; onClosed: () => void }) {
   const ref = useRef<HTMLDialogElement>(null)
-  const [detail, setDetail] = useState<Detail | null>(null)
-  const [state, setState] = useState<'loading' | 'ready' | 'missing'>('loading')
+  const [result, setResult] = useState<{ id: string; detail: Detail | null } | null>(null)
+  const current = result?.id === id ? result : null
 
   useLayoutEffect(() => {
     const dialog = ref.current
     if (!dialog) return
-    if (id && !dialog.open) dialog.showModal()
-    if (!id && dialog.open) {
+    if (id && current && !dialog.open) dialog.showModal()
+    if (dialog.open && (!id || !current)) {
       dialog.close()
-      onClosed()
+      if (!id) onClosed()
     }
-  }, [id])
+  }, [id, current])
 
   useEffect(() => {
+    setResult(null)
     if (!id) return
     let cancelled = false
-    setState('loading')
     api.item(id).then((item) => {
-      if (!cancelled) { setDetail(item); setState('ready') }
-    }).catch(() => { if (!cancelled) setState('missing') })
+      if (!cancelled) setResult({ id, detail: item })
+    }).catch(() => { if (!cancelled) setResult({ id, detail: null }) })
     return () => { cancelled = true }
   }, [id])
 
-  return <dialog ref={ref} className="detail" aria-labelledby="detail-title"
+  const detail = current?.detail
+  return <>
+    {id && !current && <p className="detail-loading" role="status">詳細を読み込んでいます…</p>}
+    <dialog ref={ref} className="detail" aria-labelledby={detail ? 'detail-title' : undefined}
+    aria-label={detail ? undefined : '記事の詳細'}
     onClick={(event) => {
       if (event.target !== event.currentTarget) return
       const { left, right, top, bottom } = event.currentTarget.getBoundingClientRect()
@@ -46,8 +50,8 @@ function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: (
     }}
     onCancel={(event) => { event.preventDefault(); onClose() }}>
     <button className="close" onClick={onClose} aria-label="閉じる">×</button>
-    {state === 'missing' && <p>表示できません。</p>}
-    {state === 'ready' && detail && <>
+    {current && !detail && <p>表示できません。</p>}
+    {detail && <>
       <h2 id="detail-title">{detail.title}</h2>
       <p className="detail-text">{detail.facts}</p>
       {detail.interpretation && <div className="detail-interpretation">
@@ -60,7 +64,8 @@ function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: (
         <p><a href={detail.url} target="_blank" rel="noopener noreferrer">{detail.source} ↗</a></p>
       </div>
     </>}
-  </dialog>
+    </dialog>
+  </>
 }
 
 function ClearDialog({ onClose }: { onClose: () => void }) {
