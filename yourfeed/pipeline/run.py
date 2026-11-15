@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
@@ -19,10 +21,11 @@ from yourfeed.search.plan import LATEST_AGE
 from yourfeed.search.searxng import Searxng
 from yourfeed.fetch import SafeHttpClient
 
-from .collect import CANDIDATES, Collector, Searcher
+from .collect import CANDIDATES, MAX_SEARCHES, Collector, Searcher
+from .concurrency import LimitedLLM, LimitedSearch, StaleUpdate, transaction
 from .pagetext import RETRYABLE, Page, PageFetcher
 from .prompt import TITLE_MAX, Style
-from .select import allocate, by_site, fill_by_weight
+from .select import allocate, by_site
 from .summarize import summarize
 from .topics import make_topics, per_update
 from .translate import missing, translate_terms
@@ -90,9 +93,11 @@ def make_clients(settings: dict[str, Any]) -> list[Backend]:
 
 class _Posting:
     def __init__(self, engine: Engine, http: SafeHttpClient, clients: list[Backend], now: datetime,
-                 run_id: int, call_cap: int, genres: dict[Any, dict[str, Any]], retention_hours: int) -> None:
+                 run_id: int, call_cap: int, genres: dict[Any, dict[str, Any]]) -> None:
         self.engine, self.now = engine, now
-        self.run_id, self.call_cap, self.genres, self.retention_hours = run_id, call_cap, genres, retention_hours
+        self.run_id, self.call_cap, self.genres = run_id, call_cap, genres
+        self.generation = None
+        self.quota = None
         self.posted = 0
         self.queues: dict[tuple[Any, int], deque[dict[str, Any]]] = {}
         self.fetcher = PageFetcher(http)
@@ -133,7 +138,7 @@ class _Posting:
         return True
 
     def _mark_attempted(self, item_id: Any, reason: str) -> None:
-        with self.engine.begin() as connection:
+        with transaction(self.engine, self.generation) as connection:
             connection.execute(text("UPDATE items SET attempted_at = now(), skip_reason = :reason WHERE id = :id"),
                                {"id": item_id, "reason": reason})
 
@@ -141,10 +146,10 @@ class _Posting:
         self.calls += calls
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
-        with self.engine.begin() as connection:
+        with transaction(self.engine, self.generation) as connection:
             connection.execute(text("""
-                UPDATE runs SET llm_calls = :calls, input_tokens = :input, output_tokens = :output WHERE id = :id
-            """), {"id": self.run_id, "calls": self.calls, "input": self.input_tokens, "output": self.output_tokens})
+                UPDATE runs SET llm_calls = llm_calls + :calls, input_tokens = input_tokens + :input, output_tokens = output_tokens + :output WHERE id = :id
+            """), {"id": self.run_id, "calls": calls, "input": input_tokens, "output": output_tokens})
 
     def _summarize(self, genre: dict[str, Any], row: dict[str, Any], window: PostWindow) -> str:
         """'ok', 'later' when the page is undated and the window wants dated ones, or 'no'."""
@@ -164,7 +169,7 @@ class _Posting:
         page_date = None if page.is_pdf and row["published_at"] else page.published_at
         published_at = page_date or row["published_at"]
         if page_date and page_date != row["published_at"]:
-            with self.engine.begin() as connection:
+            with transaction(self.engine, self.generation) as connection:
                 connection.execute(text("UPDATE items SET published_at = :at WHERE id = :id"),
                                    {"id": row["id"], "at": page_date})
         if since and published_at and published_at < since:
@@ -190,7 +195,7 @@ class _Posting:
         if outcome.status != "ok" or outcome.summary is None:
             self._mark_attempted(row["id"], outcome.status)
             return "no"
-        with self.engine.begin() as connection:
+        with transaction(self.engine, self.generation) as connection:
             connection.execute(text("""
                 INSERT INTO summaries (item_id, title, facts, interpretation, provider, model)
                 VALUES (:id, :title, :facts, :interpretation, :provider, :model)
@@ -241,7 +246,7 @@ class _Posting:
                 self.tried.add(row["id"])
             if result == "ok":
                 accepted.append(row["id"])
-                self.posted += publish(self.engine, [(genre_id, row["id"])], self.retention_hours)
+                self.posted += publish(self.engine, [(genre_id, row["id"])], generation=self.generation, quota=self.quota)
         return len(accepted) >= target
 
     def search_terms(self, genre: dict[str, Any]) -> dict[str, Any]:
@@ -261,7 +266,7 @@ class _Posting:
             break
         if made:
             translations.update(made)
-            with self.engine.begin() as connection:
+            with transaction(self.engine, self.generation) as connection:
                 connection.execute(text("UPDATE genres SET translations = CAST(:translations AS jsonb) WHERE id = :id"),
                                    {"id": genre["id"], "translations": json.dumps(translations, ensure_ascii=False)})
         return translations
@@ -285,7 +290,7 @@ class _Posting:
         if made:
             topics, index = made, 0
         picked = topics[index:index + count]
-        with self.engine.begin() as connection:
+        with transaction(self.engine, self.generation) as connection:
             connection.execute(text("UPDATE genres SET topics = :topics, topic_index = :index WHERE id = :id"),
                                {"id": genre["id"], "topics": topics, "index": index + len(picked)})
         return picked
@@ -324,94 +329,127 @@ def run_cycle(engine: Engine, *, http: SafeHttpClient | None = None,
 def _cycle(engine: Engine, http: SafeHttpClient | None, llm: LLMClient | list[LLMClient] | None,
            searcher: Searcher | None, now: datetime) -> dict[str, Any]:
     with engine.begin() as connection:
-        connection.execute(text(CLOSE_INTERRUPTED))  # the lock is held, so no other run is going on
-        settings = dict(connection.execute(text("SELECT * FROM settings WHERE id = 1")).mappings().one())
-        genres = [dict(row) for row in connection.execute(text("""
-            SELECT * FROM genres WHERE weight > 0 ORDER BY position, created_at
-        """)).mappings()]
-        total = settings["items_per_run"]
-        candidates = candidates_for(total)
-        run_id = connection.execute(text("""
-            INSERT INTO runs (target, found_target) VALUES (:target, :found_target) RETURNING id
-        """), {"target": total, "found_target": candidates}).scalar_one()
-    detail: dict[str, Any] = {"genres": {}}
+        connection.execute(text(CLOSE_INTERRUPTED))
+        settings = dict(connection.execute(text("SELECT * FROM settings WHERE id = 1 FOR UPDATE")).mappings().one())
+        genres = [dict(row) for row in connection.execute(text("SELECT * FROM genres WHERE weight > 0 ORDER BY position, created_at, id")).mappings()]
+        total = settings["feed_size"]
+        targets = allocate({g["id"]: g["weight"] for g in genres}, total)
+        candidate_targets = allocate({g["id"]: targets[g["id"]] for g in genres}, candidates_for(total))
+        search_limits = allocate(targets, MAX_SEARCHES)
+        run_id = connection.execute(text("INSERT INTO runs (target, found_target) VALUES (:target, :found) RETURNING id"),
+                                    {"target": total, "found": sum(candidate_targets.values())}).scalar_one()
     own_http, own_searcher = http is None, searcher is None
     http = http or SafeHttpClient()
     searcher = searcher or Searxng(config.searxng_url())
-    collector = Collector(engine, searcher, run_id, now)
-    posting: _Posting | None = None
-    try:
-        forget_old(engine, now)
+    limited_search = LimitedSearch(searcher, settings["search_concurrency"])
+    llm_limit = threading.BoundedSemaphore(settings["llm_concurrency"])
+    fetcher = PageFetcher(http)
+    detail: dict[str, Any] = {"genres": {}, "switches": []}
+    results = []
+
+    def run_genre(genre):
+        genre_id = genre["id"]
+        target = targets[genre_id]
         given = [llm] if llm is not None and not isinstance(llm, list) else llm
         clients = [(client.provider, client) for client in given] if given is not None else make_clients(settings)
-        posting = _Posting(engine, http, clients, now, run_id, total * CALLS_PER_POST,
-                           {genre["id"]: genre for genre in genres}, settings["retention_hours"])
-        shares = allocate({genre["id"]: genre["weight"] for genre in genres}, candidates)
-        for genre in genres:
+        clients = [(name, client if isinstance(client, LLMError) else LimitedLLM(client, llm_limit)) for name, client in clients]
+        posting = _Posting(engine, http, clients, now, run_id, target * CALLS_PER_POST, {genre_id: genre})
+        posting.fetcher, posting.generation, posting.quota = fetcher, settings["generation"], target
+        collector = Collector(engine, limited_search, run_id, now, settings["generation"], search_limits[genre_id])
+        try:
             genre["translations"] = posting.search_terms(genre)
-            genre["search_topics"] = posting.search_topics(genre, per_update(shares[genre["id"]]))
-        found_targets = collector.collect(genres, candidates)
-        found = sum(collector.found.values())
-        with engine.begin() as connection:
-            connection.execute(text("""
-                UPDATE runs SET found = :found, searches = :searches, search_error = :error WHERE id = :id
-            """), {"id": run_id, "found": found, "searches": collector.searches, "error": collector.error})
-        targets = fill_by_weight({genre["id"]: genre["weight"] for genre in genres}, total,
-                                 range(len(LATEST_WINDOWS)),
-                                 lambda genre_id: len(posting.accepted[genre_id]), posting.fill, step=1)
-        for genre in genres:
-            detail["genres"][str(genre["id"])] = {
-                "found": collector.found[genre["id"]], "found_target": found_targets[genre["id"]],
-                "posted": len(posting.accepted[genre["id"]]), "target": targets[genre["id"]]}
-        posted = posting.posted + publish(engine, [], settings["retention_hours"])
+            genre["search_topics"] = posting.search_topics(genre, per_update(candidate_targets[genre_id]))
+            collector.collect([genre], candidate_targets[genre_id])
+            for stage in range(len(LATEST_WINDOWS)):
+                if posting.fill(genre_id, target, stage):
+                    break
+            error = posting.error or collector.error
+        except StaleUpdate:
+            error = "settings_changed"
+        except Exception as exc:
+            error = type(exc).__name__
+        finally:
+            if given is None:
+                for _, wrapper in clients:
+                    if isinstance(wrapper, LimitedLLM):
+                        resource = getattr(wrapper.client, "client", None)
+                        if resource is not None and callable(getattr(resource, "close", None)):
+                            resource.close()
+        return {"id": str(genre_id), "target": target, "posted": posting.posted,
+                "found": collector.found.get(genre_id, 0), "found_target": candidate_targets[genre_id],
+                "searches": collector.searches, "search_error": collector.error, "error": error,
+                "calls": posting.calls, "input": posting.input_tokens, "output": posting.output_tokens,
+                "switches": posting.switches}
+
+    try:
+        forget_old(engine, now)
+        active = [g for g in genres if targets[g["id"]] > 0]
+        workers = min(len(active), max(5, settings["search_concurrency"], settings["llm_concurrency"]))
+        if workers:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="genre") as pool:
+                futures = {pool.submit(run_genre, genre): genre for genre in active}
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        genre = futures[future]
+                        result = {"id": str(genre["id"]), "target": targets[genre["id"]], "posted": 0,
+                                  "found": 0, "found_target": candidate_targets[genre["id"]], "searches": 0,
+                                  "search_error": None, "error": type(exc).__name__, "calls": 0,
+                                  "input": 0, "output": 0, "switches": []}
+                    results.append(result)
+                    detail["genres"][result["id"]] = result
+                    detail["switches"].extend(result["switches"])
+                    with engine.begin() as connection:
+                        connection.execute(text("UPDATE runs SET posted = :posted, found = :found, searches = :searches, detail = CAST(:detail AS jsonb) WHERE id = :id"),
+                            {"id": run_id, "posted": sum(r["posted"] for r in results), "found": sum(r["found"] for r in results),
+                             "searches": sum(r["searches"] for r in results), "detail": json.dumps(detail)})
     except Exception as exc:
-        _finish(engine, run_id, "error", posting.posted if posting else 0, posting, detail, (posting and posting.error) or type(exc).__name__)
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE runs SET status = 'error', error = :error, finished_at = now() WHERE id = :id"),
+                               {"id": run_id, "error": type(exc).__name__})
         raise
     finally:
         if own_http:
             http.close()
         if own_searcher:
             searcher.close()
-    _finish(engine, run_id, "ok", posted, posting, detail, posting.error)
-    return {"status": "ok", "found": found, "searches": collector.searches, "search_error": collector.error,
-            "target": total, "posted": posted, "llm_calls": posting.calls, "error": posting.error, **detail}
-
-
-def _finish(engine: Engine, run_id: int, status: str, posted: int, posting: _Posting | None,
-            detail: dict[str, Any], error: str | None) -> None:
+    posted, found = sum(r["posted"] for r in results), sum(r["found"] for r in results)
+    search_error = next((r["search_error"] for r in results if r["search_error"]), None)
+    error = next((r["error"] for r in results if r["error"]), None)
+    status = "partial" if posted < total or error else "ok"
     with engine.begin() as connection:
-        connection.execute(text("""
-            UPDATE runs SET finished_at = now(), status = :status, posted = :posted, error = :error,
-              llm_calls = :calls, input_tokens = :input, output_tokens = :output, detail = CAST(:detail AS jsonb)
-            WHERE id = :id
-        """), {"id": run_id, "status": status, "posted": posted, "error": error,
-               "calls": posting.calls if posting else 0, "input": posting.input_tokens if posting else 0,
-               "output": posting.output_tokens if posting else 0,
-               "detail": json.dumps({**detail, "switches": posting.switches if posting else []},
-                                    ensure_ascii=False, default=str)})
+        connection.execute(text("UPDATE runs SET finished_at = now(), status = :status, posted = :posted, found = :found, searches = :searches, search_error = :search_error, error = :error, detail = CAST(:detail AS jsonb) WHERE id = :id"),
+                           {"id": run_id, "status": status, "posted": posted, "found": found,
+                            "searches": sum(r["searches"] for r in results), "search_error": search_error,
+                            "error": error, "detail": json.dumps(detail)})
+    return {"status": status, "target": total, "posted": posted, "found": found,
+            "searches": sum(r["searches"] for r in results), "search_error": search_error,
+            "llm_calls": sum(r["calls"] for r in results), "error": error, **detail}
 
 
-def publish(engine: Engine, posts: list[tuple[Any, Any]], retention_hours: int) -> int:
-    """Insert posts so the first one is newest, then drop posts past the retention time."""
-    now = datetime.now(timezone.utc)
-    titles: list[str] = []
-    with engine.begin() as connection:
-        for index, (genre_id, item_id) in enumerate(posts):
-            title = connection.execute(text("""
-                INSERT INTO timeline_entries (item_id, genre_id, title, facts, interpretation, added_at)
-                SELECT item_id, :genre_id, title, facts, interpretation, :added_at
-                FROM summaries WHERE item_id = :item_id
-                ON CONFLICT (item_id) DO NOTHING RETURNING title
-            """), {"item_id": item_id, "genre_id": genre_id,
-                   "added_at": now - timedelta(milliseconds=index)}).scalar_one_or_none()
-            if title is not None:
-                titles.append(title)
+def publish(engine: Engine, posts: list[tuple[Any, Any]], *,
+            generation: int | None = None, quota: int | None = None) -> int:
+    """Atomically add each completed card and evict the oldest excess card in its genre."""
+    posted = 0
+    with transaction(engine, generation) as connection:
+        for genre_id, item_id in posts:
+            inserted = connection.execute(text("""
+                INSERT INTO timeline_entries (item_id, genre_id, title, facts, interpretation)
+                SELECT item_id, :genre_id, title, facts, interpretation FROM summaries WHERE item_id = :item_id
+                ON CONFLICT (item_id) DO NOTHING RETURNING id
+            """), {"item_id": item_id, "genre_id": genre_id}).scalar_one_or_none()
+            if inserted is None:
+                continue
+            posted += 1
             connection.execute(text("UPDATE items SET posted_at = now() WHERE id = :id"), {"id": item_id})
-        connection.execute(text("DELETE FROM timeline_entries WHERE added_at < :cutoff"),
-                           {"cutoff": now - timedelta(hours=retention_hours)})
-    for title in titles:
-        print(json.dumps({"event": "card_published", "title": title[:15]}, ensure_ascii=False), flush=True)
-    return len(titles)
+            if quota is not None:
+                connection.execute(text("""
+                    DELETE FROM timeline_entries WHERE id IN (
+                        SELECT id FROM timeline_entries WHERE genre_id = :genre
+                        ORDER BY added_at DESC, id DESC OFFSET :quota)
+                """), {"genre": genre_id, "quota": quota})
+    return posted
 
 
 def forget_old(engine: Engine, now: datetime) -> None:

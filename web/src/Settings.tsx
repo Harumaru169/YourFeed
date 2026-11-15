@@ -7,8 +7,6 @@ import { Link } from './router'
 
 const INTERVALS: [number, string][] = [[15, '15分'], [30, '30分'], [60, '1時間'], [120, '2時間'],
   [180, '3時間'], [360, '6時間'], [720, '12時間'], [1440, '24時間']]
-const RETENTION: [number, string][] = [[6, '6時間'], [12, '12時間'], [24, '24時間'], [48, '2日'],
-  [72, '3日'], [168, '7日']]
 const PROVIDERS: [Provider, string][] = [['openai', 'OpenAI互換API'], ['anthropic', 'Claude API'],
   ['claude_cli', 'Claude Code'], ['codex_cli', 'Codex'], ['gemini_cli', 'Gemini CLI']]
 const MAX_BACKENDS = 5
@@ -33,25 +31,27 @@ const ERRORS: Record<string, string> = {
   search_timeout: '検索が応答しません',
   search_error: '検索でエラー',
   interrupted: '中断',
+  settings_changed: '設定変更のため再更新します',
+  search_budget: '検索の上限に達しました',
 }
 const timeFormat = new Intl.DateTimeFormat('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 
 type Section = 'genres' | 'update' | 'ai'
 /** The update settings as typed, and the providers in the order they are tried. */
-type Form = { interval_minutes: string; items_per_run: string; retention_hours: string; backends: Backend[] }
+type Form = { interval_minutes: string; feed_size: string; search_concurrency: string; llm_concurrency: string; backends: Backend[] }
 type TextKey = Exclude<keyof Form, 'backends'>
 
 const toForm = (settings: SettingsValues): Form => ({
-  interval_minutes: String(settings.interval_minutes), items_per_run: String(settings.items_per_run),
-  retention_hours: String(settings.retention_hours),
+  interval_minutes: String(settings.interval_minutes), feed_size: String(settings.feed_size),
+  search_concurrency: String(settings.search_concurrency), llm_concurrency: String(settings.llm_concurrency),
   backends: [{ provider: settings.llm_provider, model: settings.llm_model }, ...settings.llm_fallbacks],
 })
 
 function toValues(form: Form): SettingsValues {
   const [main, ...fallbacks] = form.backends.map((backend) => ({ ...backend, model: backend.model.trim() }))
   return {
-    interval_minutes: Number(form.interval_minutes), items_per_run: Number(form.items_per_run),
-    retention_hours: Number(form.retention_hours), llm_provider: main.provider, llm_model: main.model,
+    interval_minutes: Number(form.interval_minutes), feed_size: Number(form.feed_size),
+    search_concurrency: Number(form.search_concurrency), llm_concurrency: Number(form.llm_concurrency), llm_provider: main.provider, llm_model: main.model,
     llm_fallbacks: fallbacks,
   }
 }
@@ -99,16 +99,6 @@ function options(list: [number, string][], current: string, unit: string, below 
   return all.map(([value, label]) => <option key={value} value={value} disabled={value < below}>{label}</option>)
 }
 
-/** The display period must cover the interval, or the timeline is empty until the next update. */
-const minRetention = (intervalMinutes: string) => Math.ceil(Number(intervalMinutes) / 60)
-
-function withInterval(form: Form, interval: string): Form {
-  const least = minRetention(interval)
-  if (Number(form.retention_hours) >= least) return { ...form, interval_minutes: interval }
-  const retention = RETENTION.find(([hours]) => hours >= least)?.[0] ?? least
-  return { ...form, interval_minutes: interval, retention_hours: String(retention) }
-}
-
 const blurOnEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
   if (event.key === 'Enter') event.currentTarget.blur()
 }
@@ -131,6 +121,13 @@ export default function Settings() {
       setWeights(Object.fromEntries(settings.genres.map((genre) => [genre.id, String(genre.weight)])))
     }).catch(() => setFailed('load'))
     return () => { if (poll.current) window.clearInterval(poll.current) }
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void api.settings().then(setData).catch(() => {})
+    }, 5000)
+    return () => window.clearInterval(timer)
   }, [])
 
   if (failed === 'load') return <main className="page"><p>接続できません。</p></main>
@@ -157,8 +154,7 @@ export default function Settings() {
 
   const change = (key: TextKey, section: Section, now = false) =>
     (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-      const next = key === 'interval_minutes' ? withInterval(form, event.target.value)
-        : { ...form, [key]: event.target.value }
+      const next = { ...form, [key]: event.target.value }
       setForm(next)
       if (now) void commit(next, section)
     }
@@ -190,8 +186,8 @@ export default function Settings() {
     }
     if (value === genre.weight) return
     try {
-      const result = await api.setWeight(genre.id, value)
-      setData((current) => current && { ...current, genres: result.genres })
+      await api.setWeight(genre.id, value)
+      setData(await api.settings())
       setFailed(null)
     } catch {
       setFailed('genres')
@@ -211,7 +207,7 @@ export default function Settings() {
     poll.current = window.setInterval(async () => {
       try {
         const latest = await api.settings()
-        setData((current) => current && { ...current, last_run: latest.last_run })
+        setData((current) => current && { ...current, last_run: latest.last_run, feed_status: latest.feed_status })
         const run = latest.last_run
         const finished = run && run.status !== 'running' && new Date(run.started_at).getTime() >= requested - 60_000
         if (finished || Date.now() - requested > 30 * 60_000) {
@@ -223,7 +219,7 @@ export default function Settings() {
   }
 
   const uses = (provider: Provider) => form.backends.some((backend) => backend.provider === provider)
-  const counts =planned(data.genres, weights, Number(form.items_per_run) || 0)
+  const counts =planned(data.genres, weights, Number(form.feed_size) || 0)
   const heading = (title: string, section: Section) => <div className="group-head">
     <h2>{title}</h2>
     {failed === section && <span className="message" role="alert">保存できません</span>}
@@ -266,14 +262,17 @@ export default function Settings() {
           {options(INTERVALS, form.interval_minutes, '分')}
         </Select>
       </label>
-      <label className="field"><span>1回の件数</span>
-        <span className="with-unit"><TextInput type="number" min={1} max={50} required value={form.items_per_run}
-          onChange={change('items_per_run', 'update')} onBlur={blur('update')} onKeyDown={blurOnEnter} />件</span>
+      <label className="field"><span>フィードの総件数</span>
+        <span className="with-unit"><TextInput type="number" min={1} max={50} required value={form.feed_size}
+          onChange={change('feed_size', 'update')} onBlur={blur('update')} onKeyDown={blurOnEnter} />件</span>
       </label>
-      <label className="field"><span>表示期間</span>
-        <Select value={form.retention_hours} onChange={change('retention_hours', 'update', true)}>
-          {options(RETENTION, form.retention_hours, '時間', minRetention(form.interval_minutes))}
-        </Select>
+      <label className="field"><span>検索の同時実行数</span>
+        <TextInput type="number" min={1} max={20} required value={form.search_concurrency}
+          onChange={change('search_concurrency', 'update')} onBlur={blur('update')} onKeyDown={blurOnEnter} />
+      </label>
+      <label className="field"><span>AIの同時実行数</span>
+        <TextInput type="number" min={1} max={20} required value={form.llm_concurrency}
+          onChange={change('llm_concurrency', 'update')} onBlur={blur('update')} onKeyDown={blurOnEnter} />
       </label>
     </form>
 
@@ -313,6 +312,10 @@ export default function Settings() {
 
     <section className="group status">
       <span>{waiting ? '更新中' : runText(data.last_run)}</span>
+      <p>フィードの充足状況</p>
+      <ul>{data.feed_status.map((genre) => <li key={genre.id}>{genre.name}：{genre.current}/{genre.target}件
+        {genre.current < genre.target ? '（不足）' : ''}
+        {data.last_run?.genres?.[genre.id] && `、前回の新規 ${data.last_run.genres[genre.id].posted}/${data.last_run.genres[genre.id].target}件`}</li>)}</ul>
       <Button type="button" onClick={() => void refresh()} disabled={waiting}>今すぐ更新</Button>
     </section>
   </main>

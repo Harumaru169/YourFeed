@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from yourfeed import config
 from yourfeed.db import get_engine
+from yourfeed.feed import changed, status
 from yourfeed.llm import DEFAULT_MODELS
 from yourfeed.search.language import LOCALES
 
@@ -65,19 +66,13 @@ class Backend(BaseModel):
 
 class SettingsIn(BaseModel):
     interval_minutes: Literal[15, 30, 60, 120, 180, 360, 720, 1440]
-    items_per_run: int = Field(ge=1, le=50)
-    retention_hours: int = Field(ge=1, le=168)
+    feed_size: int = Field(ge=1, le=50)
+    search_concurrency: int = Field(default=5, ge=1, le=20)
+    llm_concurrency: int = Field(default=5, ge=1, le=20)
     llm_provider: Provider
     llm_model: Model = ""
     # Used in order when the one before cannot be used in an update.
     llm_fallbacks: list[Backend] = Field(default_factory=list, max_length=MAX_FALLBACKS)
-
-    @model_validator(mode="after")
-    def _retention(self) -> SettingsIn:
-        # Shorter than the interval, the timeline would be empty until the next update.
-        if self.retention_hours * 60 < self.interval_minutes:
-            raise ValueError("retention_hours must cover the interval")
-        return self
 
     @model_validator(mode="after")
     def _unique_backends(self) -> SettingsIn:
@@ -136,13 +131,15 @@ def get_settings(engine: Engine = Depends(get_engine)) -> dict:
         row = dict(connection.execute(text("SELECT * FROM settings WHERE id = 1")).mappings().one())
         run = connection.execute(text("""
             SELECT started_at, finished_at, status, target, posted, found, found_target, error, search_error,
-              COALESCE(detail->'switches', '[]') AS switches
+              COALESCE(detail->'switches', '[]') AS switches, detail->'genres' AS genres
             FROM runs ORDER BY started_at DESC LIMIT 1
         """)).mappings().one_or_none()
         genres = _genre_rows(connection)
+        feed_status = status(connection)
     return {
-        "interval_minutes": row["interval_minutes"], "items_per_run": row["items_per_run"],
-        "retention_hours": row["retention_hours"], "llm_provider": row["llm_provider"],
+        "interval_minutes": row["interval_minutes"], "feed_size": row["feed_size"],
+        "search_concurrency": row["search_concurrency"], "llm_concurrency": row["llm_concurrency"],
+        "feed_status": feed_status, "llm_provider": row["llm_provider"],
         "llm_model": row["llm_model"], "llm_fallbacks": row["llm_fallbacks"], "default_models": DEFAULT_MODELS,
         "openai_base_url": config.openai_base_url(),
         "keys": {"openai": config.api_key("openai") is not None,
@@ -157,12 +154,14 @@ def get_settings(engine: Engine = Depends(get_engine)) -> dict:
 @router.put("/settings")
 def put_settings(body: SettingsIn, engine: Engine = Depends(get_engine)) -> dict:
     with engine.begin() as connection:
+        connection.execute(text("SELECT id FROM settings WHERE id = 1 FOR UPDATE"))
         connection.execute(text("""
-            UPDATE settings SET interval_minutes = :interval_minutes, items_per_run = :items_per_run,
-              retention_hours = :retention_hours, llm_provider = :llm_provider, llm_model = :llm_model,
+            UPDATE settings SET interval_minutes = :interval_minutes, feed_size = :feed_size,
+              search_concurrency = :search_concurrency, llm_concurrency = :llm_concurrency, llm_provider = :llm_provider, llm_model = :llm_model,
               llm_fallbacks = CAST(:llm_fallbacks AS jsonb), updated_at = now()
             WHERE id = 1
         """), {**body.model_dump(), "llm_fallbacks": json.dumps([backend.model_dump() for backend in body.llm_fallbacks])})
+        changed(connection)
     return get_settings(engine)
 
 
@@ -194,6 +193,7 @@ def get_genre(genre_id: UUID, engine: Engine = Depends(get_engine)) -> dict:
 def create_genre(body: GenreIn, engine: Engine = Depends(get_engine)) -> dict:
     try:
         with engine.begin() as connection:
+            connection.execute(text("SELECT id FROM settings WHERE id = 1 FOR UPDATE"))
             genre_id = connection.execute(text("""
                 INSERT INTO genres (name, latest, locales, translate, sites, focus_terms, exclude_terms, discovery_percent,
                                     min_chars, max_chars, stance, position)
@@ -201,6 +201,7 @@ def create_genre(body: GenreIn, engine: Engine = Depends(get_engine)) -> dict:
                         :min_chars, :max_chars, :stance, (SELECT COALESCE(max(position) + 1, 0) FROM genres))
                 RETURNING id
             """), body.model_dump()).scalar_one()
+            changed(connection)
             return _genre(connection, genre_id)
     except IntegrityError as exc:
         raise HTTPException(409, "name already used") from exc
@@ -210,6 +211,7 @@ def create_genre(body: GenreIn, engine: Engine = Depends(get_engine)) -> dict:
 def update_genre(genre_id: UUID, body: GenreIn, engine: Engine = Depends(get_engine)) -> dict:
     try:
         with engine.begin() as connection:
+            connection.execute(text("SELECT id FROM settings WHERE id = 1 FOR UPDATE"))
             before = _genre(connection, genre_id)
             connection.execute(text("""
                 UPDATE genres SET name = :name, latest = :latest, locales = :locales, translate = :translate,
@@ -235,6 +237,7 @@ def update_genre(genre_id: UUID, body: GenreIn, engine: Engine = Depends(get_eng
                     UPDATE items SET attempted_at = NULL, skip_reason = NULL
                     WHERE genre_id = :id AND posted_at IS NULL AND skip_reason = 'rejected'
                 """), {"id": genre_id})
+            changed(connection)
             return _genre(connection, genre_id)
     except IntegrityError as exc:
         raise HTTPException(409, "name already used") from exc
@@ -243,14 +246,18 @@ def update_genre(genre_id: UUID, body: GenreIn, engine: Engine = Depends(get_eng
 @router.patch("/genres/{genre_id}")
 def set_weight(genre_id: UUID, body: WeightIn, engine: Engine = Depends(get_engine)) -> dict:
     with engine.begin() as connection:
+        connection.execute(text("SELECT id FROM settings WHERE id = 1 FOR UPDATE"))
         if not connection.execute(text("UPDATE genres SET weight = :weight, updated_at = now() WHERE id = :id"),
                                   {"id": genre_id, "weight": body.weight}).rowcount:
             raise HTTPException(404, "not found")
+        changed(connection)
         return {"genres": _genre_rows(connection)}
 
 
 @router.delete("/genres/{genre_id}", status_code=204)
 def delete_genre(genre_id: UUID, engine: Engine = Depends(get_engine)) -> Response:
     with engine.begin() as connection:
+        connection.execute(text("SELECT id FROM settings WHERE id = 1 FOR UPDATE"))
         connection.execute(text("DELETE FROM genres WHERE id = :id"), {"id": genre_id})
+        changed(connection)
     return Response(status_code=204)

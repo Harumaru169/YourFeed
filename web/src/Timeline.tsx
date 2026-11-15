@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { api, ApiError } from './api'
-import type { Card, Detail, Run } from './api'
+import type { Card, Detail, FeedStatus, Run } from './api'
 import { Link, navigate } from './router'
 import { Button, Label, Text } from '@primer/react'
 import { Card as PrimerCard } from '@primer/react/experimental'
@@ -102,13 +102,15 @@ export default function Timeline({ path }: { path: string }) {
   const [done, setDone] = useState(false)
   const [error, setError] = useState(false)
   const [lastRun, setLastRun] = useState<Run | null>()
+  const [feedStatus, setFeedStatus] = useState<FeedStatus[]>([])
   const [confirmClear, setConfirmClear] = useState(false)
   const cursor = useRef<string | null>(null)
   const seen = useRef(new Set<string>())
   const inFlight = useRef(false)
   const loaded = useRef(false)
   const updating = useRef(false)
-  const keep = useRef<{ height: number; scrollY: number } | null>(null)
+  const keep = useRef<{ element: HTMLElement; top: number } | null>(null)
+  const cardList = useRef<HTMLElement>(null)
   const sentinel = useRef<HTMLDivElement>(null)
   const opener = useRef<{ element: HTMLElement | null; top: number; scrollY: number } | null>(null)
   const detailId = path.startsWith('/items/') ? path.split('/')[2] : null
@@ -119,7 +121,7 @@ export default function Timeline({ path }: { path: string }) {
     setBusy(true)
     setError(false)
     if (fromTop || !loaded.current) {
-      void api.settings().then((settings) => setLastRun(settings.last_run)).catch(() => {})
+      void api.settings().then((settings) => { setLastRun(settings.last_run); setFeedStatus(settings.feed_status) }).catch(() => {})
     }
     try {
       const page = await api.timeline(fromTop ? undefined : cursor.current ?? undefined)
@@ -127,11 +129,15 @@ export default function Timeline({ path }: { path: string }) {
       fresh.forEach((item) => seen.current.add(item.id))
       updating.current = page.updating
       if (fromTop && loaded.current) {
-        if (!fresh.length) return
-        // New posts go on top without moving what is being read.
-        keep.current = window.scrollY > 0
-          ? { height: document.documentElement.scrollHeight, scrollY: window.scrollY } : null
-        setCards((current) => [...fresh, ...current])
+        const incoming = new Set(page.items.map((item) => item.id))
+        const visible = window.scrollY > 0 && Array.from(cardList.current?.querySelectorAll<HTMLElement>('[data-card-id]') ?? [])
+          .find((element) => incoming.has(element.dataset.cardId ?? '') && element.getBoundingClientRect().bottom > 0
+            && element.getBoundingClientRect().top < window.innerHeight)
+        keep.current = visible ? { element: visible, top: visible.getBoundingClientRect().top } : null
+        seen.current = new Set(page.items.map((item) => item.id))
+        setCards(page.items)
+        cursor.current = page.next_cursor
+        setDone(!page.next_cursor)
       } else {
         cursor.current = page.next_cursor
         setDone(!page.next_cursor)
@@ -152,8 +158,9 @@ export default function Timeline({ path }: { path: string }) {
     const saved = keep.current
     if (!saved) return
     keep.current = null
-    const grown = document.documentElement.scrollHeight - saved.height
-    window.scrollTo({ top: saved.scrollY + grown, behavior: 'instant' })
+    if (saved.element.isConnected) {
+      window.scrollTo({ top: window.scrollY + saved.element.getBoundingClientRect().top - saved.top, behavior: 'instant' })
+    }
   }, [cards])
 
   useEffect(() => {
@@ -210,8 +217,10 @@ export default function Timeline({ path }: { path: string }) {
         <Link to="/settings" button>設定</Link>
       </div>
     </nav>
-    <section className="cards">
-      {cards.map((card) => <PrimerCard className="feed-card" key={card.id}>
+    {lastRun?.status === 'partial' && <p role="status">前回の更新では新しいカードを {lastRun.posted}/{lastRun.target} 件用意できました。</p>}
+    {feedStatus.some((genre) => genre.current < genre.target) && <p role="status">フィードに不足があります：{feedStatus.filter((genre) => genre.current < genre.target).map((genre) => `${genre.name} ${genre.current}/${genre.target}件`).join("、")}</p>}
+    <section className="cards" ref={cardList}>
+      {cards.map((card) => <PrimerCard className="feed-card" data-card-id={card.id} key={card.id}>
         <PrimerCard.Heading as="h2"><button className="card-open" onClick={(event) => open(card.id, event.currentTarget)}>{card.title}</button></PrimerCard.Heading>
         <PrimerCard.Description>{card.body}</PrimerCard.Description>
         <PrimerCard.Metadata className="card-genre"><Label>{card.genre}</Label></PrimerCard.Metadata>

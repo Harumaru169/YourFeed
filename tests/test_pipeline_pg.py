@@ -154,7 +154,7 @@ def create(client, name, weight, **extra):
 
 def settings_body(client, **changes):
     settings = client.get("/v1/settings").json()
-    keys = ("interval_minutes", "items_per_run", "retention_hours", "llm_provider", "llm_model")
+    keys = ("interval_minutes", "feed_size", "search_concurrency", "llm_concurrency", "llm_provider", "llm_model")
     return {**{key: settings[key] for key in keys}, **changes}
 
 
@@ -163,8 +163,8 @@ def test_settings_api_validates_and_guards_requests(client, engine):
     assert settings["interval_minutes"] == 60 and settings["genres"] == [] and settings["last_run"] is None
     body = settings_body(client)
     assert client.put("/v1/settings", json={**body, "interval_minutes": 7}, headers=SAME_ORIGIN).status_code == 422
-    assert client.put("/v1/settings", json={**body, "items_per_run": 51}, headers=SAME_ORIGIN).status_code == 422
-    assert client.put("/v1/settings", json={**body, "items_per_run": 4}, headers=SAME_ORIGIN).json()["items_per_run"] == 4
+    assert client.put("/v1/settings", json={**body, "feed_size": 51}, headers=SAME_ORIGIN).status_code == 422
+    assert client.put("/v1/settings", json={**body, "feed_size": 4}, headers=SAME_ORIGIN).json()["feed_size"] == 4
     # Providers to switch to: one listed twice, or the same as the main one, is dropped; four at most.
     saved = client.put("/v1/settings", json={**body, "llm_provider": "claude_cli", "llm_model": "", "llm_fallbacks": [
         {"provider": "codex_cli"}, {"provider": "claude_cli", "model": ""}, {"provider": "codex_cli", "model": " "}]},
@@ -173,12 +173,8 @@ def test_settings_api_validates_and_guards_requests(client, engine):
     assert client.put("/v1/settings", json={**body, "llm_fallbacks": [{"provider": "openai", "model": str(n)}
                                                                       for n in range(5)]},
                       headers=SAME_ORIGIN).status_code == 422
-    # The display period covers the interval, or the timeline would be empty until the next update.
-    assert client.put("/v1/settings", json={**body, "interval_minutes": 1440, "retention_hours": 12},
-                      headers=SAME_ORIGIN).status_code == 422
-    assert client.put("/v1/settings", json={**body, "interval_minutes": 1440, "retention_hours": 24},
-                      headers=SAME_ORIGIN).status_code == 200
-    assert client.put("/v1/settings", json=body, headers={"Origin": "https://evil.example"}).status_code == 403
+    assert client.put("/v1/settings", json={**body, "search_concurrency": 21}, headers=SAME_ORIGIN).status_code == 422
+    assert client.put("/v1/settings", json={**body, "llm_concurrency": 0}, headers=SAME_ORIGIN).status_code == 422
     assert client.get("/v1/timeline", headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403
     assert client.get("/v1/settings", headers={"Host": "evil.example"}).status_code == 400
 
@@ -216,84 +212,43 @@ def test_settings_api_validates_and_guards_requests(client, engine):
     assert client.get(f"/v1/genres/{genre_id}").status_code == 404
 
 
-def test_every_update_searches_the_candidates_and_fills_the_count(client, engine, monkeypatch):
-    monkeypatch.setattr(run_module, "CANDIDATES", 12)
-    client.put("/v1/settings", json=settings_body(client, items_per_run=6), headers=SAME_ORIGIN)
-    science = create(client, "科学", 3, sites=["lab.example"], focus_terms=["量子"], exclude_terms=["人事"],
-                     discovery_percent=34)
-    policy = create(client, "政策", 1, stance=0)
-    create(client, "空", 5)
-
-    class Watching(FakeLLM):
-        posted_before_call = []
-
-        def complete(self, system, messages, schema):
-            with engine.connect() as connection:
-                self.posted_before_call.append(
-                    connection.execute(text("SELECT count(*) FROM timeline_entries")).scalar_one())
-            return super().complete(system, messages, schema)
-
-    search, llm = FakeSearch(), Watching()
-    result = run_cycle(engine, http=fake_http(), llm=llm, searcher=search)
-    # Each post appears as soon as its summary is ready.
-    assert llm.posted_before_call == [0, 0, 1, 2, 3, 4, 5]
-    # 空 finds nothing, so its share of the 12 candidates goes to 科学 and 政策 by weight.
-    assert result["found"] == 12 and result["search_error"] is None
-    assert {key: value["found"] for key, value in result["genres"].items()} == {
-        science["id"]: 9, policy["id"]: 3, next(key for key in result["genres"]
-                                                  if key not in (science["id"], policy["id"])): 0}
-    assert search.queries[0] == ("科学 量子 -人事 site:lab.example", 1, "news", None)
-    assert search.languages == {"ja-JP"}
-    with engine.connect() as connection:
-        rows = connection.execute(text("""
-            SELECT i.url, i.title FROM items i JOIN genres g ON g.id = i.genre_id
-            WHERE g.name = '科学' ORDER BY i.rank
-        """)).all()
-    assert [url for url, _ in rows[:3]] == [f"https://lab.example/q/news/1/{index}" for index in range(3)]
-    assert not any("人事" in title for _, title in rows)
-
-    # 空's share goes to 科学 and 政策 by weight. 政策's page older than a week is not used, and its
-    # undated page waits until the dated ones are used.
-    assert (result["target"], result["posted"]) == (6, 6)
-    assert llm.calls == 7
-    page = client.get("/v1/timeline").json()
-    assert len(page["items"]) == 6 and page["updating"] is False
-    with engine.connect() as connection:
-        connection.execute(text("SELECT pg_advisory_lock(:key)"), {"key": WORKER_LOCK})
-        assert client.get("/v1/timeline").json()["updating"] is True
-        connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK})
-    with engine.connect() as connection:
-        posted = connection.execute(text("""
-            SELECT g.name, i.url FROM timeline_entries e JOIN items i ON i.id = e.item_id
-            JOIN genres g ON g.id = e.genre_id ORDER BY e.added_at DESC
-        """)).all()
-        run = connection.execute(text("SELECT status, target, posted, found, llm_calls, input_tokens FROM runs")).one()
-    assert sorted(name for name, _ in posted) == ["政策", "政策", "科学", "科学", "科学", "科学"]
-    assert [url for name, url in posted if name == "政策"] == ["https://gov.example/n/news/1/1",
-                                                               "https://gov.example/n/news/1/2"]
-    assert run == ("ok", 6, 6, 12, 7, 600)
-    detail = client.get(f"/v1/timeline/{page['items'][0]['id']}").json()
-    assert detail["source"] == "Example" and detail["original_title"].startswith("記事/")
-    assert page["items"][0]["body"] == detail["facts"] + detail["interpretation"]
-    assert page["items"][0]["genre"] == detail["genre"]
-
-    # With search down, the update still posts from earlier candidates; the old page is never posted.
-    again = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=FakeSearch(down=True))
-    assert (again["found"], again["search_error"], again["posted"]) == (0, "search_unavailable", 5)
-    status = client.get("/v1/settings").json()["last_run"]
-    assert (status["found"], status["found_target"], status["search_error"]) == (0, 12, "search_unavailable")
-    with engine.connect() as connection:
-        assert dict(connection.execute(text("""
-            SELECT url, skip_reason FROM items WHERE genre_id = :id AND posted_at IS NULL
-        """), {"id": policy["id"]}).all()) == {"https://gov.example/n/news/1/0": "too_old"}
-
-    third = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=FakeSearch(down=True))
-    assert third["posted"] == 0
-
+def test_quota_preserves_old_cards_when_search_fails_and_trims_on_change(client, engine, monkeypatch):
+    monkeypatch.setattr(run_module, "CANDIDATES", 6)
+    client.put("/v1/settings", json=settings_body(client, feed_size=4), headers=SAME_ORIGIN)
+    science = create(client, "科学", 1)
+    create(client, "空", 1)
+    first = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=FakeSearch())
+    assert first["posted"] == 2
+    assert first["status"] == "partial"
+    before = {entry["id"] for entry in client.get("/v1/timeline").json()["items"]}
+    assert len(before) == 2
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM items WHERE posted_at IS NULL"))
+    second = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=FakeSearch(down=True))
+    assert second["status"] == "partial"
+    after = {entry["id"] for entry in client.get("/v1/timeline").json()["items"]}
+    assert after == before
     with engine.begin() as connection:
         connection.execute(text("UPDATE timeline_entries SET added_at = now() - interval '25 hours'"))
-    publish(engine, [], 24)
-    assert client.get("/v1/timeline").json()["items"] == []
+    assert len(client.get("/v1/timeline").json()["items"]) == 2
+    client.put("/v1/settings", json=settings_body(client, feed_size=1), headers=SAME_ORIGIN)
+    assert len(client.get("/v1/timeline").json()["items"]) == 1
+    assert client.get("/v1/settings").json()["feed_status"][0]["target"] == 1
+
+
+def test_search_budget_reaches_genres_waiting_for_a_worker(client, engine):
+    client.put("/v1/settings", json=settings_body(client, feed_size=6, search_concurrency=1, llm_concurrency=1),
+               headers=SAME_ORIGIN)
+    for index in range(5):
+        create(client, f"空{index}", 1, focus_terms=[f"語{term}" for term in range(50)])
+    later = create(client, "科学", 1)
+    search = FakeSearch()
+
+    result = run_cycle(engine, http=fake_http(), llm=FakeLLM(), searcher=search)
+
+    assert any(query.startswith("科学") for query, *_ in search.queries)
+    assert result["genres"][later["id"]]["found"] > 0
+    assert result["searches"] <= run_module.MAX_SEARCHES
 
 
 def test_genres_without_weight_are_not_searched(client, engine, monkeypatch):
@@ -335,7 +290,7 @@ class DeepSearch:
 
 def test_genres_of_any_age_search_model_topics_and_use_undated_pages(client, engine, monkeypatch):
     monkeypatch.setattr(run_module, "CANDIDATES", 6)
-    client.put("/v1/settings", json=settings_body(client, items_per_run=3), headers=SAME_ORIGIN)
+    client.put("/v1/settings", json=settings_body(client, feed_size=3), headers=SAME_ORIGIN)
     space = client.post("/v1/genres", json=genre("宇宙"), headers=SAME_ORIGIN).json()
     assert space["latest"] is True
     client.delete(f"/v1/genres/{space['id']}", headers=SAME_ORIGIN)
@@ -376,7 +331,7 @@ class MixedSearch:
 
 def test_pages_in_other_languages_are_skipped_before_the_model(client, engine, monkeypatch):
     monkeypatch.setattr(run_module, "CANDIDATES", 4)
-    client.put("/v1/settings", json=settings_body(client, items_per_run=2), headers=SAME_ORIGIN)
+    client.put("/v1/settings", json=settings_body(client, feed_size=2), headers=SAME_ORIGIN)
     create(client, "宇宙", 1)
     llm = FakeLLM()
     result = run_cycle(engine, http=fake_http(), llm=llm, searcher=MixedSearch())
@@ -398,7 +353,7 @@ class EnglishSearch:
 
 def test_untranslated_summaries_use_the_page_language(client, engine, monkeypatch):
     monkeypatch.setattr(run_module, "CANDIDATES", 4)
-    client.put("/v1/settings", json=settings_body(client, items_per_run=2), headers=SAME_ORIGIN)
+    client.put("/v1/settings", json=settings_body(client, feed_size=2), headers=SAME_ORIGIN)
     create(client, "space", 1, locales=["en"], translate=False)
 
     class English:
@@ -551,7 +506,7 @@ def test_old_data_is_forgotten(client, engine):
 
 def test_a_provider_that_cannot_be_used_hands_over_to_the_next(client, engine, monkeypatch):
     monkeypatch.setattr(run_module, "CANDIDATES", 4)
-    client.put("/v1/settings", json=settings_body(client, items_per_run=2), headers=SAME_ORIGIN)
+    client.put("/v1/settings", json=settings_body(client, feed_size=2), headers=SAME_ORIGIN)
     create(client, "宇宙", 1)
 
     class Limited(FakeLLM):
@@ -583,3 +538,31 @@ def test_a_provider_that_cannot_be_used_hands_over_to_the_next(client, engine, m
     assert result["posted"] == 0
     assert client.get("/v1/settings").json()["last_run"]["switches"] == [
         {"from": "claude_cli", "error": "http_429", "to": None}]
+
+
+def test_replacement_and_generation_guard_are_atomic(client, engine):
+    from yourfeed.pipeline.concurrency import StaleUpdate
+    client.put('/v1/settings', json=settings_body(client, feed_size=1), headers=SAME_ORIGIN)
+    genre_id = create(client, '科学', 1)['id']
+    with engine.begin() as connection:
+        generation = connection.execute(text('SELECT generation FROM settings WHERE id = 1')).scalar_one()
+        item_ids = []
+        for index in range(3):
+            item_id = connection.execute(text('''
+                INSERT INTO items (genre_id, url, title) VALUES (:genre, :url, '記事') RETURNING id
+            '''), {'genre': genre_id, 'url': f'https://example.com/{index}'}).scalar_one()
+            connection.execute(text('''
+                INSERT INTO summaries (item_id, title, facts, provider, model)
+                VALUES (:item, '要約', '内容', 'fake', 'fake')
+            '''), {'item': item_id})
+            item_ids.append(item_id)
+    assert publish(engine, [(genre_id, item_ids[0])], generation=generation, quota=1) == 1
+    assert publish(engine, [(genre_id, item_ids[1])], generation=generation, quota=1) == 1
+    with engine.connect() as connection:
+        assert connection.execute(text('SELECT item_id FROM timeline_entries')).scalar_one() == item_ids[1]
+    client.put('/v1/settings', json=settings_body(client, feed_size=1), headers=SAME_ORIGIN)
+    with pytest.raises(StaleUpdate):
+        publish(engine, [(genre_id, item_ids[2])], generation=generation, quota=1)
+    with engine.connect() as connection:
+        assert connection.execute(text('SELECT item_id FROM timeline_entries')).scalar_one() == item_ids[1]
+        assert connection.execute(text('SELECT posted_at FROM items WHERE id = :id'), {'id': item_ids[2]}).scalar_one() is None

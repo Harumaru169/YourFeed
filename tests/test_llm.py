@@ -200,7 +200,7 @@ def test_providers_that_cannot_be_set_up_are_passed_over():
                             "llm_fallbacks": [{"provider": "claude_cli", "model": ""}]})
     assert [(provider, type(client).__name__) for provider, client in clients] == [
         ("openai", "LLMError"), ("claude_cli", "ClaudeCliClient")]
-    posting = _Posting(None, None, clients, datetime.now(timezone.utc), 1, 8, {}, 24)
+    posting = _Posting(None, None, clients, datetime.now(timezone.utc), 1, 8, {})
     assert isinstance(posting.llm, ClaudeCliClient) and posting.error == "no_model"
     assert posting.switches == [{"from": "openai", "error": "no_model", "to": "claude_cli"}]
     # Two failures in a row are not enough to give up on a provider; a login problem is.

@@ -31,12 +31,6 @@ UPDATING_QUERY = """
 """
 
 
-def _cutoff(engine: Engine) -> datetime:
-    with engine.connect() as connection:
-        hours = connection.execute(text("SELECT retention_hours FROM settings WHERE id = 1")).scalar_one()
-    return datetime.now(timezone.utc) - timedelta(hours=hours)
-
-
 def _source_name(row) -> str:
     return row["site_name"] or (urlsplit(row["url"]).hostname or "").removeprefix("www.")
 
@@ -65,13 +59,13 @@ def clear_timeline(engine: Engine = Depends(get_engine)) -> Response:
 
 @router.get("/timeline")
 def timeline(cursor: str | None = None, engine: Engine = Depends(get_engine)) -> dict:
-    params: dict = {"cutoff": _cutoff(engine), "limit": PAGE_SIZE}
+    params: dict = {"limit": PAGE_SIZE}
     condition = ""
     if cursor:
         params["before_at"], params["before_id"] = _parse_cursor(cursor)
         condition = " AND (e.added_at, e.id) < (:before_at, :before_id)"
     with engine.connect() as connection:
-        rows = connection.execute(text(ENTRY_QUERY + " WHERE e.added_at > :cutoff" + condition
+        rows = connection.execute(text(ENTRY_QUERY + " WHERE true" + condition
                                        + " ORDER BY e.added_at DESC, e.id DESC LIMIT :limit"),
                                   params).mappings().all()
         updating = connection.execute(text(UPDATING_QUERY), {"key": WORKER_LOCK}).scalar_one()
@@ -86,8 +80,8 @@ def timeline(cursor: str | None = None, engine: Engine = Depends(get_engine)) ->
 @router.get("/timeline/{entry_id}")
 def timeline_item(entry_id: UUID, engine: Engine = Depends(get_engine)) -> dict:
     with engine.connect() as connection:
-        row = connection.execute(text(ENTRY_QUERY + " WHERE e.id = :id AND e.added_at > :cutoff"),
-                                 {"id": entry_id, "cutoff": _cutoff(engine)}).mappings().one_or_none()
+        row = connection.execute(text(ENTRY_QUERY + " WHERE e.id = :id"),
+                                 {"id": entry_id}).mappings().one_or_none()
     if row is None:
         raise HTTPException(404, "not found")
     return {"id": str(row["id"]), "title": row["title"], "facts": row["facts"],

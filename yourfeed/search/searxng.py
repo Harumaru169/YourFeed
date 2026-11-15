@@ -108,13 +108,13 @@ class Searxng:
             if wait > 0:
                 time.sleep(wait)
             self._last = time.monotonic()
-            try:
-                response = self.client.get(f"{self.base_url}/search", params=params,
-                                           headers={"Accept": "application/json"})
-            except httpx.TimeoutException as exc:
-                raise SearchError("search_timeout") from exc
-            except httpx.TransportError as exc:
-                raise SearchError("search_unavailable", fatal=True) from exc
+        try:
+            response = self.client.get(f"{self.base_url}/search", params=params,
+                                       headers={"Accept": "application/json"})
+        except httpx.TimeoutException as exc:
+            raise SearchError("search_timeout") from exc
+        except httpx.TransportError as exc:
+            raise SearchError("search_unavailable", fatal=True) from exc
         if response.status_code == 403:
             raise SearchError("search_format", fatal=True)  # json is not in search.formats
         if response.status_code == 429:

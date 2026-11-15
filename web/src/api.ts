@@ -34,8 +34,9 @@ export interface Backend {
 
 export interface SettingsValues {
   interval_minutes: number
-  items_per_run: number
-  retention_hours: number
+  feed_size: number
+  search_concurrency: number
+  llm_concurrency: number
   llm_provider: Provider
   llm_model: string
   llm_fallbacks: Backend[]
@@ -51,7 +52,7 @@ export interface Switch {
 export interface Run {
   started_at: string
   finished_at: string | null
-  status: 'running' | 'ok' | 'error'
+  status: 'running' | 'ok' | 'partial' | 'error'
   target: number
   posted: number
   found: number
@@ -59,6 +60,7 @@ export interface Run {
   error: string | null
   search_error: string | null
   switches: Switch[]
+  genres: Record<string, { posted: number; target: number; error: string | null }> | null
 }
 
 export interface GenreRow {
@@ -74,7 +76,10 @@ export interface Settings extends SettingsValues {
   refresh_requested_at: string | null
   last_run: Run | null
   genres: GenreRow[]
+  feed_status: FeedStatus[]
 }
+
+export interface FeedStatus { id: string; name: string; current: number; target: number }
 
 export interface GenreValues {
   name: string

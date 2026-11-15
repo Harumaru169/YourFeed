@@ -13,6 +13,7 @@ from yourfeed.search.plan import MAX_PAGES, TAKE, GenreSearch, Stream, Window
 from yourfeed.search.searxng import Result, SearchError
 
 from .pagetext import RETRYABLE
+from .concurrency import transaction
 from .select import allocate, fill_by_weight, matches
 
 CANDIDATES = 50
@@ -53,9 +54,12 @@ def unreadable_hosts(engine: Engine) -> set[str]:
 
 
 class Collector:
-    def __init__(self, engine: Engine, searcher: Searcher, run_id: int, now: datetime | None = None) -> None:
+    def __init__(self, engine: Engine, searcher: Searcher, run_id: int, now: datetime | None = None,
+                 generation: int | None = None, max_searches: int = MAX_SEARCHES) -> None:
         self.engine, self.searcher, self.run_id = engine, searcher, run_id
+        self.max_searches = max_searches
         self.now = now or datetime.now(timezone.utc)
+        self.generation = generation
         self.searches = 0
         self.errors = 0
         self.error: str | None = None
@@ -78,15 +82,15 @@ class Collector:
         weights = {genre["id"]: genre["weight"] for genre in genres}
         stages = range(max((len(plan.windows) for plan in self._plans.values()), default=0))
         count = lambda genre_id: self.found[genre_id]  # noqa: E731
-        self.caps = allocate(weights, MAX_SEARCHES)
+        self.caps = allocate(weights, self.max_searches)
         targets = fill_by_weight(weights, total, stages, count, self._fill, step=TAKE, move_short=False)
-        if not self.stopped and self.searches < MAX_SEARCHES and sum(self.found.values()) < total:
+        if not self.stopped and self.searches < self.max_searches and sum(self.found.values()) < total:
             self.caps = None
             targets = fill_by_weight(weights, total, stages, count, self._fill, step=TAKE)
         return targets
 
     def _can_search(self, genre_id: Any) -> bool:
-        return (not self.stopped and self.searches < MAX_SEARCHES
+        return (not self.stopped and self.searches < self.max_searches
                 and (self.caps is None or self.used[genre_id] < self.caps.get(genre_id, 0)))
 
     def _fill(self, genre_id: Any, target: int, stage: int) -> bool:
@@ -116,7 +120,7 @@ class Collector:
                 continue
             result = stream.pending.popleft()
             self.rank += 1
-            with self.engine.begin() as connection:
+            with transaction(self.engine, self.generation) as connection:
                 added += connection.execute(text("""
                     INSERT INTO items (genre_id, url, title, snippet, published_at, run_id, rank)
                     VALUES (:genre_id, :url, :title, :snippet, :published_at, :run_id, :rank)

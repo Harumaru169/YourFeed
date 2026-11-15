@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 import re
 from dataclasses import dataclass
 from datetime import datetime, time
@@ -103,6 +104,8 @@ class PageFetcher:
         self.http = http
         self.robots: dict[str, robotparser.RobotFileParser | None] = {}
         self.blocked: set[str] = set()
+        self._lock = threading.Lock()
+        self._hosts: dict[str, threading.Lock] = {}
 
     def _robots(self, scheme: str, host: str) -> robotparser.RobotFileParser | None:
         if host not in self.robots:
@@ -124,6 +127,12 @@ class PageFetcher:
         """(page, None) or (None, reason)."""
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
+        with self._lock:
+            lock = self._hosts.setdefault(host, threading.Lock())
+        with lock:
+            return self._read(url, parts, host)
+
+    def _read(self, url, parts, host) -> tuple[Page | None, str | None]:
         if host in self.blocked:
             return None, "host_blocked"
         robots = self._robots(parts.scheme, host)

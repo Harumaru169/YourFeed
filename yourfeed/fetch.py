@@ -119,6 +119,7 @@ class SafeHttpClient:
         self.allow_private = config.allow_private_urls() if allow_private is None else allow_private
         self._lock = threading.Lock()
         self._last_request: dict[str, float] = {}
+        self._host_locks: dict[str, threading.Lock] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -151,6 +152,8 @@ class SafeHttpClient:
             check_url(current, resolver=self.resolver, allow_private=self.allow_private)
             host = urlsplit(current).hostname or ""
             with self._lock:
+                host_lock = self._host_locks.setdefault(host.lower(), threading.Lock())
+            with host_lock:
                 wait = min_interval - (time.monotonic() - self._last_request.get(host, float("-inf")))
                 if wait > 0:
                     time.sleep(wait)
