@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: yourfeed_test
+      POSTGRES_USER: yourfeed_test
+      POSTGRES_PASSWORD: yourfeed_test
+    ports:
+      - "127.0.0.1::5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yourfeed_test -d yourfeed_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 60

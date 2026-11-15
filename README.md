@@ -222,7 +222,9 @@ systemctl --user enable --now yourfeed-web yourfeed-worker
 uv run pytest
 ```
 
-`YOURFEED_TEST_DATABASE_URL` にテスト用のDBを指定すると、DBを使うテストも動きます。そのDBの中身は消えます。
+DockerとDocker Composeが必要です。DBを使うテストでは `docker-compose.test.yaml` からテスト専用のPostgreSQLコンテナを起動し、終了時にデータごと削除します。通常利用のDBは使いません。初回はイメージの取得に時間がかかります。
+
+強制終了などでコンテナが残った場合は、`docker compose ls --all` で `yourfeed-test-…` の名前を確認し、`docker compose -p <名前> -f docker-compose.test.yaml down --volumes` で削除できます。
 
 ## ライセンス
 
