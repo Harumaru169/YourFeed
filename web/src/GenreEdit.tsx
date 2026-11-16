@@ -1,8 +1,8 @@
-import { Button, Checkbox, Radio, TextInput, Textarea } from '@primer/react'
-import { useEffect, useState } from 'react'
+import { Button, Checkbox, CheckboxGroup, ConfirmationDialog, FormControl, Radio, RadioGroup, TextInput, Textarea } from '@primer/react'
+import { useEffect, useRef, useState } from 'react'
 import { api, ApiError } from './api'
 import type { Genre } from './api'
-import { Link, navigate } from './router'
+import { navigate, setNavigationGuard } from './router'
 
 const STANCES = ['事実のみ', '事実中心', '半々', '解釈多め']
 const FRESHNESS: [string, boolean][] = [['最新', true], ['問わない', false]]
@@ -61,17 +61,37 @@ export default function GenreEdit({ id }: { id: string }) {
   const isNew = id === 'new'
   const [form, setForm] = useState<Form | null>(isNew ? EMPTY : null)
   const [invalid, setInvalid] = useState<string[]>([])
-  const [message, setMessage] = useState('')
+  const [error, setError] = useState<{ field?: 'name' | 'length'; message: string } | null>(null)
   const [saving, setSaving] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [missing, setMissing] = useState(false)
+  const [loadError, setLoadError] = useState(false)
+  const [loadAttempt, setLoadAttempt] = useState(0)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const nameRef = useRef<HTMLInputElement>(null)
+  const siteRef = useRef<HTMLTextAreaElement>(null)
+  const maxRef = useRef<HTMLInputElement>(null)
+  const initial = useRef<Form | null>(isNew ? EMPTY : null)
+  const dirty = Boolean(form && initial.current && JSON.stringify(form) !== JSON.stringify(initial.current))
+  useEffect(() => {
+    if (!dirty) return
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault() }
+    window.addEventListener('beforeunload', warn)
+    setNavigationGuard(() => confirm('保存していない変更を破棄しますか？'))
+    return () => {
+      window.removeEventListener('beforeunload', warn)
+      setNavigationGuard(null)
+    }
+  }, [dirty])
 
   useEffect(() => {
     if (isNew) { setForm(EMPTY); return }
-    api.genre(id).then((genre) => setForm(toForm(genre))).catch(() => setMissing(true))
-  }, [id])
+    api.genre(id).then((genre) => { const value = toForm(genre); initial.current = value; setForm(value) }).catch((error) => { if (error instanceof ApiError && error.status === 404) setMissing(true); else setLoadError(true) })
+  }, [id, loadAttempt])
 
-  const back = <nav className="top top-start"><Link to="/settings" button>戻る</Link></nav>
+  const back = <nav className="top top-start"><Button type="button" onClick={() => { if (!dirty || confirm("保存していない変更を破棄しますか？")) navigate("/settings") }}>戻る</Button></nav>
   if (missing) return <main className="page settings">{back}<p>見つかりません。</p></main>
+  if (loadError) return <main className="page settings">{back}<p>読み込めませんでした。</p><Button onClick={() => { setLoadError(false); setLoadAttempt((n) => n + 1) }}>再試行</Button></main>
   if (!form) return <main className="page settings" aria-busy="true">{back}</main>
 
   const set = (key: keyof Form) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
@@ -86,11 +106,13 @@ export default function GenreEdit({ id }: { id: string }) {
     const minChars = Number(form.min_chars)
     const maxChars = Number(form.max_chars)
     if (wrong.length) {
-      setMessage('')
+      setError(null)
+      siteRef.current?.focus()
       return
     }
     if (maxChars < minChars + 20) {
-      setMessage('文字数の幅は20字以上にしてください')
+      setError({ field: 'length', message: '文字数の幅は20字以上にしてください' })
+      maxRef.current?.focus()
       return
     }
     const values = {
@@ -99,25 +121,34 @@ export default function GenreEdit({ id }: { id: string }) {
       min_chars: minChars, max_chars: maxChars, stance: form.stance,
     }
     setSaving(true)
-    setMessage('')
+    setError(null)
     try {
       if (isNew) await api.createGenre(values)
       else await api.saveGenre(id, values)
       navigate('/settings', true)
     } catch (error) {
-      setMessage(error instanceof ApiError && error.status === 409 ? '同じ名前のジャンルがあります' : '保存できません')
+      if (error instanceof ApiError && error.status === 409) {
+        setError({ field: 'name', message: '同じ名前のジャンルがあります' })
+        nameRef.current?.focus()
+      } else {
+        setError({ message: '保存できません' })
+      }
     } finally {
       setSaving(false)
     }
   }
 
   async function remove() {
-    if (!form || !confirm(`「${form.name}」を削除しますか`)) return
+    if (!form || saving || deleting) return
+    setDeleting(true)
     try {
       await api.deleteGenre(id)
       navigate('/settings', true)
     } catch {
-      setMessage('削除できません')
+      setConfirmDelete(false)
+      setError({ message: '削除できません' })
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -125,12 +156,14 @@ export default function GenreEdit({ id }: { id: string }) {
 
   return <main className="page settings">
     {back}
+    <h1 className="page-title">{isNew ? "ジャンルを追加" : "ジャンルを編集"}</h1>
     <form onSubmit={save}>
       <div className="group">
         <label className="field"><span>名前</span>
-          <TextInput className="text" required maxLength={40} value={form.name} onChange={set('name')} />
+          <TextInput ref={nameRef} className="text" required maxLength={40} value={form.name} onChange={set('name')} />
         </label>
-        <div className="field" role="radiogroup" aria-labelledby="latest-label"><span id="latest-label">新しさ</span>
+        {error?.field === "name" && <p className="message" role="alert">{error.message}</p>}
+        <RadioGroup name="latest" className="choice-group"><RadioGroup.Label>新しさ</RadioGroup.Label>
           <span className="segments">
             {FRESHNESS.map(([label, value]) => <label key={label} className={form.latest === value ? 'selected' : ''}>
               <Radio value={String(value)} name="latest" checked={form.latest === value}
@@ -138,9 +171,9 @@ export default function GenreEdit({ id }: { id: string }) {
               {label}
             </label>)}
           </span>
-        </div>
-        <div className="field field-top" role="group" aria-labelledby="locales-label">
-          <span id="locales-label">国と地域・言語</span>
+        </RadioGroup>
+        <CheckboxGroup className="choice-group">
+          <CheckboxGroup.Label>国と地域・言語</CheckboxGroup.Label>
           <span className="checks">
             {LOCALES.map(([value, label]) => <label key={value}>
               <Checkbox checked={form.locales.includes(value)}
@@ -148,8 +181,8 @@ export default function GenreEdit({ id }: { id: string }) {
               {label}
             </label>)}
           </span>
-        </div>
-        <div className="field" role="radiogroup" aria-labelledby="translate-label"><span id="translate-label">翻訳</span>
+        </CheckboxGroup>
+        <RadioGroup name="translate" className="choice-group"><RadioGroup.Label>翻訳</RadioGroup.Label>
           <span className="segments">
             {TRANSLATE.map(([label, value]) => <label key={label} className={form.translate === value ? 'selected' : ''}>
               <Radio value={String(value)} name="translate" checked={form.translate === value}
@@ -157,30 +190,31 @@ export default function GenreEdit({ id }: { id: string }) {
               {label}
             </label>)}
           </span>
-        </div>
+        </RadioGroup>
       </div>
 
       <div className="group">
-        <label className="field field-top"><span>サイト</span>
-          <Textarea rows={Math.max(2, lines(form.sites).length + 1)} spellCheck={false} wrap="off"
+        <FormControl className="group-control"><FormControl.Label>サイト</FormControl.Label>
+          <Textarea ref={siteRef} rows={Math.max(2, lines(form.sites).length + 1)} spellCheck={false} wrap="off"
             value={form.sites} onChange={set('sites')} aria-invalid={invalid.length > 0} />
-        </label>
-        {invalid.length > 0 && <ul className="field-note" role="alert">
-          {invalid.map((site) => <li key={site}>読み取れません　{site}</li>)}
-        </ul>}
+          <FormControl.Caption>1行に1件入力してください（例：example.com）。</FormControl.Caption>
+          {invalid.length > 0 && <FormControl.Validation variant="error">読み取れません: {invalid.join("、")}</FormControl.Validation>}
+        </FormControl>
       </div>
 
       <div className="group">
-        <label className="field field-top"><span>注目する語</span>
+        <FormControl className="group-control"><FormControl.Label>注目する語</FormControl.Label>
           <Textarea rows={3} value={form.focus_terms} onChange={set('focus_terms')} />
-        </label>
+          <FormControl.Caption>1行に1件入力してください。</FormControl.Caption>
+        </FormControl>
         {hasTerms && <label className="field"><span>注目語以外</span>
           <span className="with-unit"><TextInput type="number" min={0} max={100} required value={form.discovery_percent}
             onChange={set('discovery_percent')} />%</span>
         </label>}
-        <label className="field field-top"><span>除外する語</span>
+        <FormControl className="group-control"><FormControl.Label>除外する語</FormControl.Label>
           <Textarea rows={2} value={form.exclude_terms} onChange={set('exclude_terms')} />
-        </label>
+          <FormControl.Caption>1行に1件入力してください。</FormControl.Caption>
+        </FormControl>
       </div>
 
       <div className="group">
@@ -188,11 +222,12 @@ export default function GenreEdit({ id }: { id: string }) {
           <span className="with-unit">
             <TextInput type="number" min={40} max={800} required aria-label="最小の文字数" value={form.min_chars}
               onChange={set('min_chars')} />〜
-            <TextInput type="number" min={40} max={800} required aria-label="最大の文字数" value={form.max_chars}
+            <TextInput ref={maxRef} type="number" min={40} max={800} required aria-label="最大の文字数" value={form.max_chars}
               onChange={set('max_chars')} />字
           </span>
         </div>
-        <div className="field" role="radiogroup" aria-labelledby="stance-label"><span id="stance-label">事実と解釈</span>
+        {error?.field === "length" && <p className="message" role="alert">{error.message}</p>}
+        <RadioGroup name="stance" className="choice-group"><RadioGroup.Label>事実と解釈</RadioGroup.Label>
           <span className="segments">
             {STANCES.map((label, index) => <label key={label} className={form.stance === index ? 'selected' : ''}>
               <Radio value={String(index)} name="stance" checked={form.stance === index}
@@ -200,14 +235,25 @@ export default function GenreEdit({ id }: { id: string }) {
               {label}
             </label>)}
           </span>
-        </div>
+        </RadioGroup>
       </div>
 
       <div className="actions">
-        <Button type="submit" variant="primary" disabled={saving}>{saving ? '保存中' : '保存'}</Button>
-        <span className="message" role="status">{message}</span>
-        {!isNew && <Button type="button" variant="danger" className="danger" onClick={() => void remove()}>削除</Button>}
+        <Button type="submit" variant="primary" disabled={saving || deleting}>{saving ? '保存中…' : '保存'}</Button>
+        <span className="message" role="status">{!error?.field && error?.message}</span>
+        {!isNew && <Button type="button" variant="danger" className="danger" disabled={saving || deleting} onClick={() => setConfirmDelete(true)}>削除</Button>}
       </div>
     </form>
+    {confirmDelete && <ConfirmationDialog
+      title={`「${form.name}」を削除しますか？`}
+      confirmButtonContent="削除" cancelButtonContent="キャンセル" confirmButtonType="danger"
+      confirmButtonLoading={deleting}
+      onClose={(gesture) => {
+        if (deleting) return
+        if (gesture === 'confirm') void remove()
+        else setConfirmDelete(false)
+      }}>
+      ジャンルの設定を削除します。
+    </ConfirmationDialog>}
   </main>
 }

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import type { Backend, GenreRow, Provider, Run, Settings as SettingsData, SettingsValues, Switch } from './api'
 import { Link } from './router'
+import ClearDialog from './ClearDialog'
 
 const INTERVALS: [number, string][] = [[15, '15分'], [30, '30分'], [60, '1時間'], [120, '2時間'],
   [180, '3時間'], [360, '6時間'], [720, '12時間'], [1440, '24時間']]
@@ -110,6 +111,10 @@ export default function Settings() {
   const [weights, setWeights] = useState<Record<string, string>>({})
   const [failed, setFailed] = useState<Section | 'load' | null>(null)
   const [waiting, setWaiting] = useState(false)
+  const [refreshError, setRefreshError] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [loadAttempt, setLoadAttempt] = useState(0)
   const saved = useRef<Form | null>(null)
   const poll = useRef<number | null>(null)
 
@@ -121,7 +126,7 @@ export default function Settings() {
       setWeights(Object.fromEntries(settings.genres.map((genre) => [genre.id, String(genre.weight)])))
     }).catch(() => setFailed('load'))
     return () => { if (poll.current) window.clearInterval(poll.current) }
-  }, [])
+  }, [loadAttempt])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -130,8 +135,8 @@ export default function Settings() {
     return () => window.clearInterval(timer)
   }, [])
 
-  if (failed === 'load') return <main className="page"><p>接続できません。</p></main>
-  if (!data || !form) return <main className="page" aria-busy="true" />
+  if (failed === 'load') return <main className="page"><h1 className="page-title">設定</h1><p>接続できません。</p><Button onClick={() => { setFailed(null); setLoadAttempt((n) => n + 1) }}>再試行</Button></main>
+  if (!data || !form) return <main className="page" aria-busy="true"><p role="status">設定を読み込んでいます…</p></main>
 
   async function commit(next: Form, section: Section) {
     if (saved.current && JSON.stringify(next) === JSON.stringify(saved.current)) return
@@ -140,6 +145,7 @@ export default function Settings() {
       setFailed(section)
       return
     }
+    setSaving(true)
     try {
       const result = await api.saveSettings(toValues(next))
       saved.current = toForm(result)
@@ -149,7 +155,7 @@ export default function Settings() {
       if (section === 'ai') setForm((current) => current && { ...current, backends: toForm(result).backends })
     } catch {
       setFailed(section)
-    }
+    } finally { setSaving(false) }
   }
 
   const change = (key: TextKey, section: Section, now = false) =>
@@ -178,12 +184,10 @@ export default function Settings() {
   }
   const removeBackend = (index: number) => setBackends(form.backends.filter((_, position) => position !== index), true)
 
-  async function saveWeight(genre: GenreRow) {
-    const value = Number(weights[genre.id])
-    if (!Number.isInteger(value) || value < 0 || value > 100) {
-      setFailed('genres')
-      return
-    }
+  async function saveWeight(genre: GenreRow, input: HTMLInputElement) {
+    input.setCustomValidity(input.value.trim() ? '' : '比率を0〜100の整数で入力してください。')
+    if (!input.reportValidity()) return
+    const value = input.valueAsNumber
     if (value === genre.weight) return
     try {
       await api.setWeight(genre.id, value)
@@ -196,10 +200,12 @@ export default function Settings() {
 
   async function refresh() {
     setWaiting(true)
+    setRefreshError(false)
     try {
       await api.refresh()
     } catch {
       setWaiting(false)
+      setRefreshError(true)
       return
     }
     const requested = Date.now()
@@ -228,6 +234,8 @@ export default function Settings() {
   return <main className="page settings">
     <nav className="top top-start"><Link to="/" button>戻る</Link></nav>
 
+    <h1 className="page-title">設定</h1>
+    <p className="note" role="status">{saving ? "保存中…" : "変更は自動保存されます。"}</p>
     <section className="group">
       <div className="group-head"><h2>外観</h2></div>
       <label className="field"><span>テーマ</span>
@@ -239,20 +247,24 @@ export default function Settings() {
 
     <section className="group">
       {heading('ジャンル', 'genres')}
+      <p className="note">比率はジャンル間の重みです。件数は配分予定です。</p>
       {data.genres.length > 0 && <>
-        <div className="genre-columns" aria-hidden="true"><span /><span>比率</span><span>件数</span></div>
-        <ul className="genres">
-          {data.genres.map((genre) => <li key={genre.id} className={counts[genre.id] ? '' : 'off'}>
-            <Link to={`/settings/genres/${genre.id}`} className="genre-name">{genre.name}</Link>
-            <TextInput type="number" min={0} max={100} required aria-label={`${genre.name}の比率`}
+        <table className="genres">
+          <thead><tr><th scope="col">ジャンル</th><th scope="col">比率</th><th scope="col">予定件数</th></tr></thead>
+          <tbody>{data.genres.map((genre) => <tr key={genre.id} className={counts[genre.id] ? '' : 'off'}>
+            <th scope="row"><Link to={`/settings/genres/${genre.id}`} className="genre-name">{genre.name}</Link></th>
+            <td><TextInput type="number" min={0} max={100} required aria-label={`${genre.name}の比率`}
               value={weights[genre.id] ?? ''} onKeyDown={blurOnEnter}
-              onChange={(event) => setWeights({ ...weights, [genre.id]: event.target.value })}
-              onBlur={() => void saveWeight(genre)} />
-            <span className="count">{counts[genre.id]}件</span>
-          </li>)}
-        </ul>
+              onChange={(event) => {
+                event.target.setCustomValidity('')
+                setWeights({ ...weights, [genre.id]: event.target.value })
+              }}
+              onBlur={(event) => void saveWeight(genre, event.currentTarget)} /></td>
+            <td className="count">{counts[genre.id]}件</td>
+          </tr>)}</tbody>
+        </table>
       </>}
-      <Link to="/settings/genres/new" className="button">ジャンルを追加</Link>
+      <Link to="/settings/genres/new" button>ジャンルを追加</Link>
     </section>
 
     <form className="group" data-section="update" onSubmit={(event) => event.preventDefault()}>
@@ -316,7 +328,10 @@ export default function Settings() {
       <ul>{data.feed_status.map((genre) => <li key={genre.id}>{genre.name}：{genre.current}/{genre.target}件
         {genre.current < genre.target ? '（不足）' : ''}
         {data.last_run?.genres?.[genre.id] && `、前回の新規 ${data.last_run.genres[genre.id].posted}/${data.last_run.genres[genre.id].target}件`}</li>)}</ul>
+      {refreshError && <p className="message" role="alert">更新を開始できませんでした。もう一度お試しください。</p>}
       <Button type="button" onClick={() => void refresh()} disabled={waiting}>今すぐ更新</Button>
     </section>
+    <section className="group"><h2>キャッシュ</h2><p className="note">記事候補と表示中のカードを削除します。</p><Button onClick={() => setConfirmClear(true)}>キャッシュをクリア</Button></section>
+    {confirmClear && <ClearDialog onClose={() => setConfirmClear(false)} />}
   </main>
 }

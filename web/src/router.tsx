@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { LinkButton } from '@primer/react'
 
 const EVENT = 'yourfeed:navigate'
+let navigationGuard: (() => boolean) | null = null
+export function setNavigationGuard(guard: (() => boolean) | null) { navigationGuard = guard }
 
 export function navigate(path: string, replace = false) {
   if (replace) history.replaceState({}, '', path)
@@ -11,12 +13,18 @@ export function navigate(path: string, replace = false) {
 
 export function usePath() {
   const [path, setPath] = useState(location.pathname)
+  const current = useRef(path)
+  current.current = path
   useEffect(() => {
     const update = () => setPath(location.pathname)
-    window.addEventListener('popstate', update)
+    const onPop = () => {
+      if (navigationGuard && !navigationGuard()) { history.pushState({}, '', current.current); return }
+      update()
+    }
+    window.addEventListener('popstate', onPop)
     window.addEventListener(EVENT, update)
     return () => {
-      window.removeEventListener('popstate', update)
+      window.removeEventListener('popstate', onPop)
       window.removeEventListener(EVENT, update)
     }
   }, [])

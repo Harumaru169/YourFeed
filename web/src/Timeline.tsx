@@ -2,8 +2,10 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { api, ApiError } from './api'
 import type { Card, Detail, FeedStatus, Run } from './api'
 import { Link, navigate } from './router'
-import { Button, Label, Text } from '@primer/react'
+import { Banner, Button, IconButton, Label, Text } from '@primer/react'
 import { Card as PrimerCard } from '@primer/react/experimental'
+
+const CloseIcon = () => <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 1 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z" /></svg>
 
 const UPDATING_MS = 5 * 1000
 const IDLE_MS = 60 * 1000
@@ -15,7 +17,8 @@ const updateFormat = new Intl.DateTimeFormat('ja-JP', {
 
 function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: () => void; onClosed: () => void }) {
   const ref = useRef<HTMLDialogElement>(null)
-  const [result, setResult] = useState<{ id: string; detail: Detail | null } | null>(null)
+  const [result, setResult] = useState<{ id: string; detail: Detail | null; missing?: boolean } | null>(null)
+  const [attempt, setAttempt] = useState(0)
   const current = result?.id === id ? result : null
 
   useLayoutEffect(() => {
@@ -34,9 +37,9 @@ function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: (
     let cancelled = false
     api.item(id).then((item) => {
       if (!cancelled) setResult({ id, detail: item })
-    }).catch(() => { if (!cancelled) setResult({ id, detail: null }) })
+    }).catch((error) => { if (!cancelled) setResult({ id, detail: null, missing: error instanceof ApiError && error.status === 404 }) })
     return () => { cancelled = true }
-  }, [id])
+  }, [id, attempt])
 
   const detail = current?.detail
   return <>
@@ -49,8 +52,8 @@ function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: (
       if (event.clientX < left || event.clientX > right || event.clientY < top || event.clientY > bottom) onClose()
     }}
     onCancel={(event) => { event.preventDefault(); onClose() }}>
-    <button className="close" onClick={onClose} aria-label="閉じる">×</button>
-    {current && !detail && <p>表示できません。</p>}
+    <IconButton className="close" icon={CloseIcon} variant="invisible" onClick={onClose} aria-label="閉じる" />
+    {current && !detail && <div><p>{current.missing ? "記事が見つかりません。" : "記事を読み込めませんでした。"}</p>{!current.missing && <Button onClick={() => setAttempt((value) => value + 1)}>再試行</Button>}</div>}
     {detail && <>
       <h2 id="detail-title">{detail.title}</h2>
       <p className="detail-text">{detail.facts}</p>
@@ -68,38 +71,6 @@ function DetailDialog({ id, onClose, onClosed }: { id: string | null; onClose: (
   </>
 }
 
-function ClearDialog({ onClose }: { onClose: () => void }) {
-  const ref = useRef<HTMLDialogElement>(null)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  useEffect(() => { ref.current?.showModal() }, [])
-
-  async function clear() {
-    setBusy(true)
-    setError('')
-    try {
-      await api.clearTimeline()
-      window.location.reload()
-    } catch (cause) {
-      setError(cause instanceof ApiError && cause.status === 409
-        ? '更新中はクリアできません。更新が終わってからお試しください。'
-        : 'クリアできませんでした。もう一度お試しください。')
-      setBusy(false)
-    }
-  }
-
-  return <dialog ref={ref} className="detail" aria-labelledby="clear-title"
-    onCancel={(event) => { event.preventDefault(); if (!busy) onClose() }}>
-    <h2 id="clear-title">キャッシュをクリアしますか？</h2>
-    <p>記事候補、要約、表示中のカードを削除します。設定とジャンルは残ります。</p>
-    <p>次の更新で同じ記事が再び表示されることがあります。</p>
-    {error && <p className="message" role="alert">{error}</p>}
-    <div className="clear-actions">
-      <Button onClick={onClose} disabled={busy}>キャンセル</Button>
-      <Button variant="danger" onClick={() => void clear()} disabled={busy}>{busy ? 'クリア中…' : 'クリアする'}</Button>
-    </div>
-  </dialog>
-}
 
 export default function Timeline({ path }: { path: string }) {
   const [cards, setCards] = useState<Card[]>([])
@@ -108,7 +79,6 @@ export default function Timeline({ path }: { path: string }) {
   const [error, setError] = useState(false)
   const [lastRun, setLastRun] = useState<Run | null>()
   const [feedStatus, setFeedStatus] = useState<FeedStatus[]>([])
-  const [confirmClear, setConfirmClear] = useState(false)
   const cursor = useRef<string | null>(null)
   const seen = useRef(new Set<string>())
   const inFlight = useRef(false)
@@ -218,12 +188,14 @@ export default function Timeline({ path }: { path: string }) {
           : `最終更新：${updateFormat.format(new Date(lastRun.finished_at ?? lastRun.started_at))}`}
       </Text>
       <div className="feed-actions">
-        <Button onClick={() => setConfirmClear(true)}>キャッシュをクリア</Button>
         <Link to="/settings" button>設定</Link>
       </div>
     </nav>
-    {lastRun?.status === 'partial' && <p role="status">前回の更新では新しいカードを {lastRun.posted}/{lastRun.target} 件用意できました。</p>}
-    {feedStatus.some((genre) => genre.current < genre.target) && <p role="status">フィードに不足があります：{feedStatus.filter((genre) => genre.current < genre.target).map((genre) => `${genre.name} ${genre.current}/${genre.target}件`).join("、")}</p>}
+    <h1 className="page-title">フィード</h1>
+    {lastRun?.status === 'partial' && <Banner variant="warning" title="前回の更新で記事が不足しました" description={`新しいカードを ${lastRun.posted}/${lastRun.target} 件用意できました。`} />}
+    {feedStatus.some((genre) => genre.current < genre.target) && <Banner variant="warning" title="フィードに不足があります" description={feedStatus.filter((genre) => genre.current < genre.target).map((genre) => `${genre.name} ${genre.current}/${genre.target}件`).join("、")} />}
+    {busy && !cards.length && <p role="status">記事を読み込んでいます…</p>}
+    {!busy && !error && loaded.current && cards.length === 0 && <p>記事はまだありません。<Link to="/settings">設定</Link>からジャンルを追加して更新してください。</p>}
     <section className="cards" ref={cardList}>
       {cards.map((card) => <PrimerCard className="feed-card" data-card-id={card.id} key={card.id}>
         <PrimerCard.Heading as="h2"><button className="card-open" onClick={(event) => open(card.id, event.currentTarget)}>{card.title}</button></PrimerCard.Heading>
@@ -231,12 +203,10 @@ export default function Timeline({ path }: { path: string }) {
         <PrimerCard.Metadata className="card-genre"><Label>{card.genre}</Label></PrimerCard.Metadata>
       </PrimerCard>)}
     </section>
-    {error && <div className="notice" role="alert">
-      <span>接続できません。</span>
-      <Button onClick={() => void load(false)}>再試行</Button>
-    </div>}
+    {error && <Banner variant="critical" title="接続できません" primaryAction={<Button onClick={() => void load(false)}>再試行</Button>} />}
+    {busy && cards.length > 0 && <p role="status">読み込んでいます…</p>}
+    {done && cards.length > 0 && <p className="note">すべての記事を表示しました。</p>}
     <div ref={sentinel} className="end" />
     <DetailDialog id={detailId} onClose={close} onClosed={restore} />
-    {confirmClear && <ClearDialog onClose={() => setConfirmClear(false)} />}
   </main>
 }
